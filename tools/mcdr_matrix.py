@@ -30,6 +30,7 @@ The plugin version tested is whatever ``mcdreforged.plugin.json`` says; the
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -100,10 +101,51 @@ def build_plugin() -> Path:
     return out
 
 
+def _interpreter_has_own_mcdr(python: str) -> bool:
+    probe = subprocess.run(
+        [python, "-c", "import mcdreforged"],
+        capture_output=True,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        timeout=120,
+    )
+    return probe.returncode == 0
+
+
+def child_env(python: str) -> dict:
+    """The environment to start MCDR (and, through it, the fake server) in.
+
+    Two things have to be right, and getting either wrong is silent:
+
+    * ``.testlibs`` may be the only place MCDR exists — the CI layout, where the interpreter has
+      nothing but pytest. Then it must be on ``PYTHONPATH``, and it must be an **absolute** path:
+      the instance runs in a temporary directory, so a relative ``.testlibs`` stops resolving
+      there and MCDR dies with "No module named mcdreforged" — which reads like a broken plugin
+      rather than a broken path.
+    * If the interpreter has its own MCDR (the local layout of one virtualenv per version), the
+      inherited ``PYTHONPATH`` must be **dropped**: it precedes site-packages, so a
+      ``.testlibs/mcdreforged`` would shadow the version being tested and the matrix would
+      report "several versions pass" while running one of them several times.
+
+    The probe decides, once per interpreter.
+    """
+    env = dict(os.environ)
+    testlibs = REPO / ".testlibs"
+
+    if not testlibs.is_dir() or _interpreter_has_own_mcdr(python):
+        env.pop("PYTHONPATH", None)
+        return env
+
+    existing = env.get("PYTHONPATH", "")
+    parts = [str(testlibs)] + [part for part in existing.split(os.pathsep) if part]
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
 def mcdr_version(python: str) -> str:
     proc = subprocess.run(
         [python, "-c", "import mcdreforged;print(mcdreforged.__version__)"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+        env=child_env(python),
     )
     return proc.stdout.strip() or "unknown"
 
@@ -161,13 +203,14 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
                          "total_hits": 0, "last_hit_session": 0}},
     }, indent=2))
 
+    env = child_env(python)
     subprocess.run([python, "-m", "mcdreforged", "init"], cwd=str(root),
-                   capture_output=True, timeout=180)
+                   capture_output=True, timeout=180, env=env)
 
     proc = subprocess.Popen([python, "-m", "mcdreforged"], cwd=str(root),
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace")
+                            encoding="utf-8", errors="replace", env=env)
     lines, stopping_at = [], None
     started = time.time()
     try:

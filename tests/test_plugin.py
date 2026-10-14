@@ -900,6 +900,38 @@ def test_packager_ships_submodules_recursively(tmp_path, monkeypatch):
     assert "server_log_filter/sub/helper.py" in names, names
 
 
+def test_the_matrix_tool_hands_mcdr_an_absolute_testlibs_path(monkeypatch):
+    """The cross-version tool starts MCDR inside a temporary instance directory.
+
+    A relative ``PYTHONPATH`` stops resolving there, so MCDR exits immediately with
+    "No module named mcdreforged" and the job reports "the plugin did not load" — which is how
+    this reached CI: the workflow exported ``PYTHONPATH=.testlibs``, the tool inherited it, and
+    every version failed while the same command passed locally against interpreters that have
+    their own MCDR. Two properties are pinned here:
+
+    * the path handed to the child is absolute;
+    * when the interpreter already has MCDR of its own, no ``PYTHONPATH`` is handed over at all —
+      it precedes site-packages, so a ``.testlibs/mcdreforged`` would shadow the version under
+      test and the matrix would "pass" several times against the same one.
+    """
+    import importlib.util
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("slf_matrix_tool", root / "tools" / "mcdr_matrix.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    monkeypatch.setenv("PYTHONPATH", ".testlibs")
+    monkeypatch.setattr(tool, "_interpreter_has_own_mcdr", lambda _python: False)
+    handed = tool.child_env("python")["PYTHONPATH"].split(os.pathsep)
+    assert handed[0].endswith(".testlibs"), handed
+    assert os.path.isabs(handed[0]), "a relative path stops resolving in the instance directory"
+    assert ".testlibs" in handed, "the caller's own entry must survive"
+
+    monkeypatch.setattr(tool, "_interpreter_has_own_mcdr", lambda _python: True)
+    assert "PYTHONPATH" not in tool.child_env("python")
+
+
 def test_packager_root_entries_would_be_illegal_if_denylisted():
     """Documents *why* the allowlist exists, using a real denylist build.
 
