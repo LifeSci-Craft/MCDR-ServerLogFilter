@@ -32,6 +32,7 @@ import time
 import zipfile
 
 import pytest
+from mcdreforged.api.types import PermissionLevel
 
 import server_log_filter as slf
 from server_log_filter import i18n
@@ -54,7 +55,6 @@ class _SelfMetadata:
 
     name = _PLUGIN_META["name"]
     version = _PLUGIN_META["version"]
-from mcdreforged.api.types import PermissionLevel
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,7 @@ class RecordingLogger:
         self.infos = []
         self.warnings = []
         self.errors = []
+        self.exceptions = []
 
     def info(self, msg, *a, **k):
         self.infos.append(str(msg))
@@ -91,6 +92,18 @@ class RecordingLogger:
 
     def error(self, msg, *a, **k):
         self.errors.append(str(msg))
+
+    def exception(self, msg, *a, **k):
+        """MCDR's logger has it and prints the current traceback.
+
+        The fake records the message plus the live exception so a test can assert on the
+        diagnostic content without depending on MCDR's formatter; ``sys.exc_info`` is the
+        same traceback the real logger would render.
+        """
+        detail = sys.exc_info()[1]
+        rendered = str(msg) if detail is None else "{} ({!r})".format(msg, detail)
+        self.exceptions.append(rendered)
+        self.errors.append(rendered)
 
 
 def make_rules(patterns):
@@ -392,11 +405,29 @@ def test_reset_counters_zeroes_total_and_each_rule():
     assert all(r.count == 0 for r in f.rules)
 
 
-def test_first_matching_rule_wins_and_is_counted_once():
+def test_every_matching_rule_is_counted_not_just_the_first():
+    """SLF-02 改的正是这条旧语义。
+
+    旧断言把"只给第一条计数"钉成了期望行为（``rules[1].count == 0``），于是被遮蔽的
+    规则统计永远是 0、``zero_streak`` 一路涨，插件会建议管理员删掉一条**正在正常
+    工作**的规则。现在一行命中几条就记几条；"隐去"仍然只发生一次。
+    """
     f = make_filter(["alpha", "alpha beta"])
     f.filter_server_info(FakeInfo("alpha beta"))
+
+    assert f.rules[0].count == 1
+    assert f.rules[1].count == 1, "被第一条遮蔽的规则也在工作，必须一起计数"
+    assert f.total == 2, "两处计数各自加一（total 记的是命中次数，不是被隐去的行数）"
+
+
+def test_a_rule_that_really_does_not_match_still_stays_at_zero():
+    """放宽到"全部命中都计数"不能变成"全都计数"。"""
+    f = make_filter(["alpha", "gamma"])
+    f.filter_server_info(FakeInfo("alpha beta"))
+
     assert f.rules[0].count == 1
     assert f.rules[1].count == 0
+    assert f.total == 1
 
 
 def test_log_matched_lines_flag_writes_to_logger():
@@ -869,6 +900,38 @@ def test_packager_ships_submodules_recursively(tmp_path, monkeypatch):
     assert "server_log_filter/sub/helper.py" in names, names
 
 
+def test_the_matrix_tool_hands_mcdr_an_absolute_testlibs_path(monkeypatch):
+    """The cross-version tool starts MCDR inside a temporary instance directory.
+
+    A relative ``PYTHONPATH`` stops resolving there, so MCDR exits immediately with
+    "No module named mcdreforged" and the job reports "the plugin did not load" — which is how
+    this reached CI: the workflow exported ``PYTHONPATH=.testlibs``, the tool inherited it, and
+    every version failed while the same command passed locally against interpreters that have
+    their own MCDR. Two properties are pinned here:
+
+    * the path handed to the child is absolute;
+    * when the interpreter already has MCDR of its own, no ``PYTHONPATH`` is handed over at all —
+      it precedes site-packages, so a ``.testlibs/mcdreforged`` would shadow the version under
+      test and the matrix would "pass" several times against the same one.
+    """
+    import importlib.util
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("slf_matrix_tool", root / "tools" / "mcdr_matrix.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    monkeypatch.setenv("PYTHONPATH", ".testlibs")
+    monkeypatch.setattr(tool, "_interpreter_has_own_mcdr", lambda _python: False)
+    handed = tool.child_env("python")["PYTHONPATH"].split(os.pathsep)
+    assert handed[0].endswith(".testlibs"), handed
+    assert os.path.isabs(handed[0]), "a relative path stops resolving in the instance directory"
+    assert ".testlibs" in handed, "the caller's own entry must survive"
+
+    monkeypatch.setattr(tool, "_interpreter_has_own_mcdr", lambda _python: True)
+    assert "PYTHONPATH" not in tool.child_env("python")
+
+
 def test_packager_root_entries_would_be_illegal_if_denylisted():
     """Documents *why* the allowlist exists, using a real denylist build.
 
@@ -952,7 +1015,7 @@ def test_idle_rule_is_reported_once_the_streak_reaches_the_threshold():
     slf.on_server_startup(server)
     text = warnings_of(server)
     assert IDLE in text
-    assert "有 1 条过滤规则连续 2 次及以上开服都没有命中" in text
+    assert "有 1 条过滤规则已经连续 2 个开服周期一次都没命中过" in text
     # the rule that is working is not mentioned
     assert LIVE not in text
 
@@ -971,14 +1034,14 @@ def test_stale_warning_does_not_repeat_the_streak_for_every_rule():
     slf.on_server_startup(server)
 
     text = warnings_of(server)
-    assert "有 2 条过滤规则连续 1 次及以上开服都没有命中" in text
+    assert "有 2 条过滤规则已经连续 1 个开服周期一次都没命中过" in text
     # both patterns are listed
     assert "· " + IDLE in text
     assert "· another-idle-rule" in text
     # ...but the per-rule streak sentence appears exactly zero times
-    assert "从未命中过" not in text
-    assert "开服零命中；" not in text
-    assert text.count("都没有命中") == 1, "the header must be stated once"
+    assert "（已连续" not in text
+    assert "都没有命中" not in text
+    assert text.count("一次都没命中过") == 1, "the header must be stated once"
 
 
 def test_a_rule_idle_longer_than_the_threshold_still_says_so():
@@ -994,8 +1057,8 @@ def test_a_rule_idle_longer_than_the_threshold_still_says_so():
     slf.on_server_startup(server)
 
     text = warnings_of(server)
-    assert "连续 1 次及以上" in text
-    assert "（已连续 4 次零命中）" in text, "a longer streak must not be hidden"
+    assert "连续 1 个开服周期一次都没命中过" in text
+    assert "（已连续 4 个周期没命中）" in text, "a longer streak must not be hidden"
 
 
 def test_a_rule_at_exactly_the_threshold_gets_no_annotation():
@@ -1015,7 +1078,7 @@ def test_a_matching_rule_never_becomes_stale():
         run_session(server, hits={LIVE: 3})
         slf.on_server_start(server)
         slf.on_server_startup(server)
-        assert "都没有命中" not in warnings_of(server)
+        assert "一次都没命中过" not in warnings_of(server)
 
 
 def test_a_single_hit_resets_the_streak():
@@ -1049,7 +1112,7 @@ def test_a_session_that_never_reached_startup_is_not_counted():
 
     slf.on_server_start(server)
     slf.on_server_startup(server)
-    assert "都没有命中" not in warnings_of(server)
+    assert "一次都没命中过" not in warnings_of(server)
 
 
 def test_warning_can_be_switched_off():
@@ -1070,7 +1133,7 @@ def test_threshold_zero_disables_the_warning():
         run_session(server)
         slf.on_server_start(server)
         slf.on_server_startup(server)
-    assert "都没有命中" not in warnings_of(server)
+    assert "一次都没命中过" not in warnings_of(server)
 
 
 def test_state_forgets_patterns_that_left_the_config():
@@ -1394,13 +1457,31 @@ def test_a_nonsense_probe_budget_does_not_reject_every_rule():
     literal. The filter then silently hid nothing while the log pointed at the wrong
     cause. The budget is floored at 1 ms, which still separates microseconds (real rules)
     from hundreds of milliseconds (dangerous ones).
+
+    这里同时钉住**下限真的被传下去**：只看"规则被保留"是不够的——``_probe_pattern``
+    内部还会把长探测串的预算夹到至少 1 ms，所以把外面的下限去掉，这条断言仍然会过
+    （变异检查里一度就是这样报"存活"）。所以要直接检查传给探测的预算。
     """
     for budget in (0, -5):
-        server = start_plugin(
-            config={"patterns": [LIVE], "pattern_probe_timeout_ms": budget}
-        )
-        assert len(slf._log_filter.rules) == 1, "rule lost at budget={}".format(budget)
+        server = FakePluginServer()
+        seen = []
+        original = slf._probe_pattern
+
+        def spy(regex, budget_ms, _seen=seen, _original=original):
+            _seen.append(budget_ms)
+            return _original(regex, budget_ms)
+
+        slf._probe_pattern = spy
+        try:
+            rules = slf._build_rules(server, [LIVE], probe_budget_ms=budget)
+        finally:
+            slf._probe_pattern = original
+
+        assert [r.pattern for r in rules] == [LIVE], "rule lost at budget={}".format(budget)
         assert server.logger.errors == [], server.logger.errors
+        assert seen and min(seen) >= slf.MIN_PROBE_BUDGET_MS, (
+            "预算没有被夹到下限，探测拿到的是 {}".format(seen)
+        )
 
 
 def test_probing_realistic_patterns_stays_cheap():
@@ -1504,14 +1585,22 @@ def test_non_matching_line_leaves_the_action_flag_alone():
     assert info.action_flag == "UNTOUCHED"
 
 
-def test_matching_stops_at_the_first_rule():
-    """Rule order decides, and later rules are not even evaluated."""
-    expensive = slf.Rule(r"never-matches-this-\d")
-    f = slf.ServerLogFilter([slf.Rule(LIVE), expensive], RecordingLogger(), False)
+def test_matching_no_longer_short_circuits_but_still_reports_order():
+    """热路径不再"遇到第一条就停"——但"第一条命中"的语义仍由 ``match()`` 保留。
+
+    旧用例 ``test_matching_stops_at_the_first_rule`` 断言后面的规则"根本不被求值"，
+    那正是 SLF-02 要改掉的：不求值就等于不计数。这里把它反过来钉住。
+    """
+    later = slf.Rule(r"standing on air - force-sending blocks below")
+    f = slf.ServerLogFilter([slf.Rule(LIVE), later], RecordingLogger(), False)
     info = FakeInfo("Player Steve standing on air - force-sending blocks below")
     f.filter_server_info(info)
+
     assert f.rules[0].count == 1
-    assert expensive.count == 0
+    assert later.count == 1, "被前面规则遮蔽的规则也必须被求值并计数"
+    assert f.match("Player Steve standing on air - force-sending blocks below") is f.rules[0], (
+        "哪一条最先命中仍然如实回答"
+    )
 
 
 def test_state_tracking_adds_no_work_to_the_per_line_path():
@@ -1980,7 +2069,7 @@ def keys_referenced_in_the_code():
                 continue
             target = node.func
             name = getattr(target, "id", None) or getattr(target, "attr", None)
-            if name not in ("_t", "say", "translate"):
+            if name not in ("_t", "say", "translate", "translate_values"):
                 continue
             first = node.args[0]
             if isinstance(first, ast.Constant) and isinstance(first.value, str):
@@ -1988,6 +2077,12 @@ def keys_referenced_in_the_code():
     keys |= {doc_key for _, doc_key in slf.CONFIG_DOC.values()}
     # Never a literal at a call site: i18n.resolve() hands it back as a note key.
     keys.add(i18n.UNSUPPORTED_KEY)
+    # ``_probe_pattern`` returns a key *name* rather than a sentence and the caller
+    # formats it later, so its two keys cannot be seen as a literal at a call site.
+    keys |= set(slf.PROBE_DETAIL_KEYS)
+    # Same shape for the diagnostics the language probes record: the key travels as
+    # ``_note()``'s first argument, never as ``_t("...")``.
+    keys |= set(slf.NOTE_KEYS)
     return keys
 
 
@@ -2074,7 +2169,10 @@ def only_these_catalogues(monkeypatch, files):
 
     monkeypatch.setattr(i18n, "_resource_bytes", reader)
     monkeypatch.setattr(
-        i18n, "_list_lang_files", lambda: sorted("{}.json".format(k) for k in files)
+        i18n,
+        "_list_lang_files",
+        # accepts the optional diagnostics bucket the real function grew in SLF-06
+        lambda notes=None: sorted("{}.json".format(k) for k in files),
     )
     i18n.clear_cache()
 
@@ -2211,7 +2309,7 @@ def test_english_reaches_the_stale_rule_warning():
     slf.on_server_startup(server)
 
     text = warnings_of(server)
-    assert "have matched nothing for 1 or more consecutive sessions" in text
+    assert "have never matched anything across 1 consecutive sessions" in text
     assert "!!logfilter test" in text, "the advice has to survive translation"
 
 
@@ -2626,10 +2724,10 @@ def test_the_title_degrades_gracefully_without_metadata():
 
 def test_help_rows_are_aligned_in_one_column():
     """说明文字要跟在同一列，不能因为子命令有长有短就左右乱跳。"""
-    lines = [l for l in _help_text().splitlines() if l.startswith(slf.COMMAND_ALIAS)]
+    lines = [line for line in _help_text().splitlines() if line.startswith(slf.COMMAND_ALIAS)]
     assert len(lines) == 5, lines
 
-    columns = {l.index("-- ") for l in lines}
+    columns = {line.index("-- ") for line in lines}
     assert len(columns) == 1, "分隔符没有对齐: {}".format(sorted(columns))
     assert columns.pop() > len(slf.COMMAND_ALIAS) + 1, "命令与说明之间要有间距"
 
@@ -2723,7 +2821,7 @@ def test_the_status_screen_uses_the_same_palette_as_help():
 def test_status_rule_rows_have_the_same_separator_as_help_rows():
     """规则行也用 ``--``，而且落在固定列上——和帮助页一个形状。"""
     text = str(_status_text(rules=(LIVE, "joined the game", "moved too quickly")))
-    rows = [l for l in text.splitlines() if l.startswith(" [")]
+    rows = [line for line in text.splitlines() if line.startswith(" [")]
     assert len(rows) == 3, rows
 
     columns = {r.index("-- ") for r in rows}
@@ -2753,7 +2851,7 @@ def test_the_status_screen_labels_its_language_and_tip():
 
 def test_a_single_digit_rule_index_has_no_padding():
     """``[ 1]`` 里那个空格是给两位数对齐用的，只有 9 条以内时它是纯噪音。"""
-    rows = [l for l in str(_status_text()).splitlines() if l.startswith(" [")]
+    rows = [line for line in str(_status_text()).splitlines() if line.startswith(" [")]
     assert len(rows) == 1, rows
     assert rows[0].startswith(" [1]"), rows[0]
 
@@ -2761,7 +2859,7 @@ def test_a_single_digit_rule_index_has_no_padding():
 def test_two_digit_rule_indices_still_line_up():
     """10 条以上才补空格——这时它真的买到了对齐。"""
     patterns = [LIVE] + ["noise-{:03d}-\\w+".format(i) for i in range(1, 12)]
-    rows = [l for l in str(_status_text(rules=patterns)).splitlines() if l.startswith(" [")]
+    rows = [line for line in str(_status_text(rules=patterns)).splitlines() if line.startswith(" [")]
     assert len(rows) == 12, len(rows)
 
     assert rows[0].startswith(" [ 1]"), rows[0]
@@ -3033,3 +3131,1128 @@ def test_the_changelog_has_no_duplicate_headings():
     headings = [line.strip() for line in text.splitlines() if line.startswith("#")]
     duplicates = {h for h in headings if headings.count(h) > 1}
     assert not duplicates, "CHANGELOG 里有重复标题: {}".format(sorted(duplicates))
+
+
+# ---------------------------------------------------------------------------
+#  16. 回溯探测的规模盲区（SLF-01）与配置上限（SLF-09）
+#
+#  **这一组里的长输入必须放进带超时的子进程。** 指数级回溯的正则一旦被真正跑起来，
+#  单次 ``re.search`` 就会把测试进程钉死几分钟到几小时——纯 Python 给 C 层的
+#  ``re.search`` 加不了超时，能指望的只有「在外面套一层进程超时」。
+# ---------------------------------------------------------------------------
+
+_PROBE_SUBPROCESS_TIMEOUT = 120.0
+
+
+def probe_in_subprocess(pattern, budget_ms=25, timeout=_PROBE_SUBPROCESS_TIMEOUT):
+    """在子进程里跑一次 ``_probe_pattern``，返回耗时秒数。
+
+    超时就直接失败并说清是哪条模式：那意味着探测本身被拖住了，而不是"测试写得慢"。
+    """
+    snippet = (
+        "import re, sys, time\n"
+        "sys.path.insert(0, {repo!r})\n"
+        "sys.path.insert(0, {libs!r})\n"
+        "import server_log_filter as slf\n"
+        "rx = re.compile(sys.argv[1])\n"
+        "start = time.perf_counter()\n"
+        "slf._probe_pattern(rx, int(sys.argv[2]))\n"
+        "print(time.perf_counter() - start)\n"
+    ).format(
+        repo=str(REPO),
+        libs=str(pathlib.Path(__file__).resolve().parent.parent / ".testlibs"),
+    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", snippet, pattern, str(budget_ms)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "探测在 {:.0f}s 内没有返回，说明它自己被这条模式拖住了: {!r}".format(
+                timeout, pattern
+            )
+        )
+    assert done.returncode == 0, done.stderr
+    return float(done.stdout.strip())
+
+
+def test_the_probe_is_growth_based_not_length_fixed():
+    """旧版是**固定 22 字符**探测串，于是 `(a|aa)+$` 从探测里溜过去了。
+
+    实测（本机，见本次修复报告）：22 字符 4.7 ms、24 字符 12 ms、26 字符 33 ms、
+    30 字符 234 ms——每 +2 字符约 ×2.6。22 字符那一点低于 25 ms 预算，所以旧探测
+    判定"通过"；而它在真实日志行长度上会让 MCDR 主线程**每行都卡**。
+
+    现在探测串最长的仍是 12/24 与接近真实行长的文本档，靠的是**增长率**：同一个
+    模式的 t(2n)/t(n) 会远高于阈值。这条用例就是钉住"它不再靠一个固定长度下结论"。
+    """
+    assert len(slf.GROWTH_PROBE_LENGTHS) == 2, "增长判据需要 n 与 2n 两个长度"
+    assert slf.GROWTH_PROBE_LENGTHS[1] == 2 * slf.GROWTH_PROBE_LENGTHS[0]
+    # 每个字母表一对，否则 `(x+x+)+y` 这类只在特定字符上爆炸的模式会漏掉
+    assert len(slf.GROWTH_PROBE_PAIRS) >= 2
+    assert slf.PROBE_GROWTH_RATIO < 100, "阈值太松就抓不住指数曲线"
+    # 接近真实日志行长的档必须存在（真实 MC 行普遍 60-300 字符）
+    assert max(len(s) for s in slf.PROBE_SUBJECTS) >= 60
+
+
+def test_the_probe_bounds_its_own_worst_case():
+    """探测长度必须小到对最坏的模式也能跑完。
+
+    `(a|aa)+$` 在 40 字符上要 31 s、200 字符上约 10^40 步。所以增长档的长度上限
+    是硬约束：一旦有人把它调大（想让信号更强），守卫自己就变成了一次挂死。
+    """
+    assert max(slf.GROWTH_PROBE_LENGTHS) <= 32, (
+        "增长档太长会让指数级模式自己把探测卡住：{}".format(slf.GROWTH_PROBE_LENGTHS)
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"(a|aa)+$",
+        r"(\w+\s?)*$",
+        r"(a+)+$",
+        r"^(a|a)*$",
+        r"(a*)*b",
+        r"^(x+x+)+y",
+        r"(a+){2,}$",
+    ],
+)
+def test_an_exponential_pattern_is_refused_by_the_real_probe(pattern):
+    """每一条都在**独立子进程**里跑：其中几条在长串上是无界的。"""
+    elapsed = probe_in_subprocess(pattern)
+    assert elapsed < 30.0, "探测本身花了 {:.1f}s: {!r}".format(elapsed, pattern)
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [pattern])
+    assert rules == [], "{!r} 应该被拦下".format(pattern)
+    assert any("灾难性回溯" in msg for msg in server.logger.errors)
+
+
+def test_the_pattern_the_old_probe_let_through_is_now_caught():
+    """SLF-01 的直因：这条模式在旧探测（固定 22 字符）下**通过**。
+
+    它必须现在被拒——这是整条发现的验收条件。放进子进程是因为它在真实日志行长度上
+    会让 `re.search` 跑几十小时。
+    """
+    pattern = r"(a|aa)+$"
+    elapsed = probe_in_subprocess(pattern)
+    assert elapsed < 30.0
+    verdict = slf._probe_pattern(re.compile(pattern), 25)
+    assert verdict is not None, "旧探测放过的模式必须被新探测拦下"
+    assert verdict[0] in slf.PROBE_DETAIL_KEYS, verdict
+
+
+def test_a_long_probe_subject_carries_the_cost_signal():
+    """接近真实日志行长的探测串必须真的在比较耗时的档上。
+
+    只留短串的话，"只在长输入上变坏"的模式就被漏掉了；这条用例钉住那个档确实存在，
+    而且对一条正常规则它仍然是免费的（微秒级）。
+    """
+    long_subjects = [s for s in slf.PROBE_SUBJECTS if len(s) >= 60]
+    assert long_subjects, "缺少接近真实日志行长的探测档"
+    rx = re.compile(r"standing on air - force-sending blocks below")
+    for subject in long_subjects:
+        start = time.perf_counter()
+        rx.search(subject)
+        assert time.perf_counter() - start < 0.01, subject
+
+
+def test_probing_an_exponential_pattern_does_not_stall_the_command_thread():
+    r"""最坏情况必须留在"值得付"的量级：一次加载可以花到秒级，但不能是分钟级。
+
+    实测最坏是 `(\w+\s?)*$` 约 1.5 s（一个探测串长度的单次 search），其余在百毫秒级。
+    """
+    for pattern in (r"(a|aa)+$", r"(a*)*b", r"(x+x+)+y"):
+        elapsed = probe_in_subprocess(pattern)
+        assert elapsed < 5.0, "{!r} 的探测花了 {:.2f}s".format(pattern, elapsed)
+
+
+def test_a_huge_probe_budget_is_clamped_with_a_warning():
+    """SLF-09：`pattern_probe_timeout_ms` 只有下限没有上限，写大值会卡住加载期。
+
+    上限与探测改造是一致关系：探测是在 on_load（以及 ``!!lf reload`` 的命令线程）
+    上同步跑的，所以这个值必须有天花板，且钳制时要说话。
+    """
+    server = FakePluginServer()
+    seen = []
+    original = slf._probe_pattern
+
+    def spy(regex, budget_ms):
+        seen.append(budget_ms)
+        return original(regex, budget_ms)
+
+    slf._probe_pattern = spy
+    try:
+        rules = slf._build_rules(
+            server, [LIVE], probe_budget_ms=10 ** 9
+        )
+    finally:
+        slf._probe_pattern = original
+
+    assert [r.pattern for r in rules] == [LIVE]
+    assert seen == [slf.MAX_PROBE_BUDGET_MS], seen
+    assert any("pattern_probe_timeout_ms" in m for m in server.logger.warnings)
+
+
+def test_a_tiny_probe_budget_is_still_floored():
+    """下限的行为不能被上限改动顺手弄丢。"""
+    server = FakePluginServer()
+    seen = []
+    original = slf._probe_pattern
+
+    def spy(regex, budget_ms):
+        seen.append(budget_ms)
+        return original(regex, budget_ms)
+
+    slf._probe_pattern = spy
+    try:
+        slf._build_rules(server, [LIVE], probe_budget_ms=0)
+    finally:
+        slf._probe_pattern = original
+
+    assert seen == [slf.MIN_PROBE_BUDGET_MS], seen
+
+
+def test_a_budget_inside_the_range_is_not_announced():
+    """没钳制过就不该说话——否则每次加载都刷一条无意义警告。"""
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [LIVE], probe_budget_ms=17)
+    assert [r.pattern for r in rules] == [LIVE]
+    assert not any("pattern_probe_timeout_ms" in m for m in server.logger.warnings)
+
+
+def test_the_probe_documents_that_it_is_only_a_heuristic():
+    """发现里明确要求把「探测不是形式化保证」写进开发文档——它是启发式。"""
+    text = (pathlib.Path(__file__).resolve().parent.parent / "docs" / "DEVELOPMENT.md").read_text(
+        encoding="utf-8"
+    )
+    assert "启发式" in text and "形式化保证" in text
+
+
+# ---------------------------------------------------------------------------
+#  17. 一行命中多条规则时的统计（SLF-02 / SLF-05 / SLF-13）
+# ---------------------------------------------------------------------------
+
+BROAD = r"Player Steve standing on air"
+SHADOWED = r"standing on air - force-sending blocks below"
+SHADOW_LINE = "Player Steve standing on air - force-sending blocks below"
+
+
+def test_a_shadowed_rule_is_not_reported_as_never_matching():
+    """SLF-02 的核心：被前面规则遮蔽的规则**正在工作**，不能报它「从未命中」。
+
+    旧实现"遇到第一条匹配就 return 并且只给它计数"，于是第二条规则
+    ``count == 0 / zero_streak == 3``，控制台被告知「连续 N 次零命中」并**建议管理员
+    把它从 patterns 里删掉**——而删掉后对应日志立刻重新刷屏。
+
+    修复后一行命中的每条规则都计数，所以它的 ``zero_streak`` 一直是 0。
+    （顺带说明为什么不能只改判据：被遮蔽的规则 ``count`` 确实是 0，
+    "本轮 count == 0" 区分不出"被遮蔽"与"真的没命中"。）
+    """
+    server = start_plugin(
+        config={"patterns": [BROAD, SHADOWED], "stale_rule_threshold": 2}
+    )
+    for _ in range(4):
+        run_session(server, hits={BROAD: 3, SHADOWED: 3})
+    assert slf._state.rules[SHADOWED].zero_streak == 0
+
+    for _ in range(4):
+        slf.on_server_start(server)
+        slf.on_server_startup(server)          # 这里才是旧实现误报的位置
+        for _ in range(3):
+            slf._log_filter.filter_server_info(FakeInfo(SHADOW_LINE))
+        slf.on_server_stop(server, 0)
+
+    text = warnings_of(server)
+    assert SHADOWED not in text, "被遮蔽的规则正在工作，不该被建议删除: " + text
+    # 两条规则都真的在计数——这正是"不只是判据放宽"的证据
+    assert [r.count for r in slf._log_filter.rules] == [3, 3]
+
+
+def test_a_rule_that_matched_this_session_is_never_reported():
+    """判据里「本轮 count == 0」这一条的直接验收。"""
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    for _ in range(3):
+        run_session(server)                      # streak climbs to 3
+    assert slf._state.rules[IDLE].zero_streak == 3
+    server.logger.warnings.clear()
+
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    assert IDLE in warnings_of(server), "前置条件：这一轮它还没命中过"
+
+    server.logger.warnings.clear()
+    slf.on_server_start(server)
+    for rule in slf._log_filter.rules:           # 这一轮它命中了
+        rule.count = 1
+    slf.on_server_startup(server)
+    assert IDLE not in warnings_of(server), "本轮命中过的规则不该出现在零命中提醒里"
+
+
+def test_a_stale_streak_is_not_re_announced_after_a_skipped_session():
+    """SLF-05：中间有一个周期没走到 startup 时，已修好的规则不再被重复告警。
+
+    管理员把写错的规则改对之后，若恰好有一个开服周期没走到 startup（崩溃 / 手动
+    kill），``zero_streak`` 会停在阈值上。旧实现下一次成功开服时先读旧值再告警，
+    于是刚修好的规则又被报一次——与之相反的正是注释里声称的防护目标。
+    """
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 2})
+    run_session(server)
+    run_session(server)
+    assert slf._state.rules[IDLE].zero_streak == 2
+
+    # 一个没走到 startup 的周期：不结算，也不该改变 streak
+    run_session(server, reach_startup=False)
+    assert slf._state.rules[IDLE].zero_streak == 2
+
+    # 下一轮它命中了 -> 不该再被报
+    slf.on_server_start(server)
+    for rule in slf._log_filter.rules:
+        rule.count = 5
+    slf.on_server_startup(server)
+    assert IDLE not in warnings_of(server), "刚修好的规则又被报了一次"
+
+    run_session(server, hits={IDLE: 5})
+    assert slf._state.rules[IDLE].zero_streak == 0
+
+
+def test_the_status_screen_explains_the_counting_rule():
+    """SLF-13：各规则命中数之和与「本次已隐去」不可加，界面必须说明。"""
+    server = start_plugin(config={"patterns": [BROAD, SHADOWED]})
+    del server
+    source = FakeSource()
+    slf._show_status(source)
+    text = "".join(str(x) for x in source.replies)
+    assert "说明" in text and "只需要隐去一次" in text, text
+    # 界面上仍然同时给出两处数字（说明而不是隐瞒）
+    assert "本次已隐去" in text
+
+
+def test_the_status_screen_get_counts_through_the_lock():
+    """SLF-10：读取处统一走 ``counted_hits()``，不再裸读 ``rule.count``。
+
+    裸读在 CPython 下不会真的坏，但它让"哪些统计加锁、哪些不加"无法从代码判断。
+    这里钉住读口径只有一条路：状态页的数字来自 ``counted_hits`` 的快照。
+    """
+    server = start_plugin(config={"patterns": [LIVE]})
+    slf._log_filter.filter_server_info(FakeInfo(SHADOW_LINE))
+    del server
+
+    calls = []
+    original = slf.ServerLogFilter.counted_hits
+
+    def spy(self, rules=None):
+        calls.append(rules)
+        return original(self, rules)
+
+    slf.ServerLogFilter.counted_hits = spy
+    try:
+        slf._show_status(FakeSource())
+    finally:
+        slf.ServerLogFilter.counted_hits = original
+
+    assert len(calls) == 1, "状态页必须通过 counted_hits 读命中数"
+
+
+def test_counted_hits_matches_the_rules_it_was_given():
+    f = make_filter(["alpha", "beta"])
+    for line in ["alpha 1", "beta 1", "alpha 2", "alpha 3"]:
+        f.filter_server_info(FakeInfo(line))
+    assert f.counted_hits() == [3, 1]
+    assert f.counted_hits(list(f.rules)) == [3, 1]
+
+
+# ---------------------------------------------------------------------------
+#  18. 提前 return 之后的生命周期（SLF-03）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pretend_mcdr_is_too_old(monkeypatch):
+    """把 ``InfoActionFlag`` 置空，模拟 MCDR < 2.15.0。"""
+    monkeypatch.setattr(slf, "InfoActionFlag", None)
+    return monkeypatch
+
+
+def test_a_low_version_mcdr_survives_the_whole_lifecycle(
+    pretend_mcdr_is_too_old, monkeypatch
+):
+    """SLF-03：``on_server_startup`` 缺 ``_config`` 判空，每次开服完成都抛 AttributeError。
+
+    低版本路径上 on_load 打一条错误就 return，``_config`` 仍是 None；而 MCDR 照常
+    派发生命周期事件。原来 ``on_server_startup`` 进来第一句就是
+    ``None.warn_about_stale_rules``。用户会同时看到「请升级 MCDR」和一条更吓人的
+    traceback，同事件里排在后面的插件处理器还可能收不到该事件。
+    """
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+
+    assert any("MCDR" in m for m in server.logger.errors), "还是要说清原因"
+    assert slf._config is None and slf._log_filter is None and slf._state is None
+
+    # 完整生命周期：一个都不许抛
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    slf.on_server_stop(server, 0)
+    assert server.info_filters == [], "低版本上不注册过滤器"
+
+
+def test_the_low_version_path_resets_the_module_globals(monkeypatch):
+    """提前 return 之前必须显式置空：模块级全局在进程内是复用的。
+
+    否则一次"先正常加载、再降级重载"会让 on_server_startup 拿旧过滤器算统计。
+    """
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)                       # 正常加载，三个全局都有值
+    assert slf._log_filter is not None
+
+    monkeypatch.setattr(slf, "InfoActionFlag", None)
+    slf.on_load(server, None)                       # 降级加载
+
+    assert slf._config is None
+    assert slf._log_filter is None, "旧过滤器必须被丢掉"
+    assert slf._state is None
+    assert slf._session_reached_startup is False
+
+
+def test_a_bare_startup_without_a_config_is_harmless():
+    """即使三个全局同时为 None（例如手工调用），on_server_startup 也只是安静地返回。"""
+    saved = (slf._config, slf._log_filter, slf._state)
+    slf._config = slf._log_filter = slf._state = None
+    try:
+        slf.on_server_startup(FakePluginServer())
+        slf.on_server_start(FakePluginServer())
+        slf.on_server_stop(FakePluginServer(), 0)
+    finally:
+        slf._config, slf._log_filter, slf._state = saved
+
+
+# ---------------------------------------------------------------------------
+#  19. 类型写坏的配置也要被检疫（SLF-04）
+# ---------------------------------------------------------------------------
+
+# 合法 JSON、字段类型不对 —— 例如把阈值写成字符串。MCDR 的默认 failure_policy='regen'
+# 会直接用默认值覆盖原文件，所以这一种必须和语法错走同一条备份 + 播报路径。
+BAD_TYPES_JSON = """{
+    "patterns": ["ZZZ-THE-ADMIN-WROTE-THIS"],
+    "stale_rule_threshold": "three"
+}
+"""
+
+
+def test_a_type_error_config_is_quarantined(tmp_path):
+    """SLF-04：类型写坏的配置以前走 MCDR 的 REGEN，用户 patterns 静默消失。"""
+    server, folder = server_with_config_file(tmp_path, BAD_TYPES_JSON)
+    slf._language = "zh_cn"
+
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert reason is not None, "类型不符必须被识别出来"
+    assert "类型" in reason, reason
+    backup = folder / (slf.CONFIG_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)
+    assert backup.is_file(), "类型写坏的配置也必须留下 .old"
+    assert backup.read_text(encoding="utf-8") == BAD_TYPES_JSON, "原文件要逐字节保留"
+    assert "ZZZ-THE-ADMIN-WROTE-THIS" in backup.read_text(encoding="utf-8")
+
+
+def test_a_type_error_config_keeps_the_admin_patterns_in_the_backup(tmp_path):
+    """备份里必须是用户写的那份原文——这正是这套机制要保住的东西。
+
+    走完整的 ``on_load``：真机 MCDR 会在检疫之后用默认值重建配置，这里只断言
+    "备份先发生"（重建由 ``FakePluginServer`` 不模拟）。
+
+    用 ``write_bytes`` 落盘，测试文本里的 ``\\n`` 就不会在 Windows 上被写成 CRLF——
+    "逐字节保留"这条断言必须比的是**同一串字节**。
+    """
+    folder = tmp_path / "cfg"
+    folder.mkdir()
+    raw = BAD_TYPES_JSON.encode("utf-8")
+    (folder / "config.json").write_bytes(raw)
+    server = FakePluginServer(data_folder=str(folder))
+
+    try:
+        slf.on_load(server, None)
+    except Exception as error:         # FakePluginServer 不做 REGEN，容忍它失败
+        assert "three" in str(error) or isinstance(error, TypeError), error
+
+    backup = folder / (slf.CONFIG_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)
+    assert backup.is_file(), "类型写坏的配置也必须留下 .old"
+    assert backup.read_bytes() == raw, "原文件要逐字节保留"
+    assert "ZZZ-THE-ADMIN-WROTE-THIS" in raw.decode("utf-8")
+    assert not (folder / slf.CONFIG_FILE_NAME).exists(), "原文件被挪走"
+
+
+def test_the_type_error_notice_is_announced_like_a_syntax_error(tmp_path):
+    """并发播报：同一条 broken.* 提示，只是原因换成了类型不符。"""
+    server, folder = server_with_config_file(tmp_path, BAD_TYPES_JSON)
+    slf._language = "zh_cn"
+
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert len(server.logger.errors) == 1
+    text = server.logger.errors[0]
+    assert "配置文件无法解析" in text
+    assert "config.json.old" in text
+    assert "类型" in text, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"patterns": "not-a-list"}),
+        json.dumps({"stale_rule_threshold": "three"}),
+        json.dumps({"log_matched_lines": "yes"}),
+        json.dumps({"patterns": [1, 2, 3]}),
+    ],
+)
+def test_every_type_mismatch_is_quarantined(tmp_path, text):
+    server, folder = server_with_config_file(tmp_path, text)
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+    assert reason is not None, "这些配置都应被判定为写坏: {}".format(text)
+    assert (folder / (slf.CONFIG_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)).is_file()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"patterns": ["a"]}),
+        json.dumps({"patterns": [], "stale_rule_threshold": 5}),
+        json.dumps({"unknown_future_option": 1, "patterns": ["a"]}),
+    ],
+)
+def test_a_sound_config_is_not_touched_by_the_type_check(tmp_path, text):
+    """不能把"未来版本多出来的键"也当成类型错误——那会让升级变成一次假警报。"""
+    server, folder = server_with_config_file(tmp_path, text)
+    assert slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME) is None
+    assert server.logger.errors == []
+    assert not (folder / (slf.CONFIG_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)).exists()
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("{ not json", "JSON 语法错误"),
+        ('["a", "b"]', "顶层应为 JSON 对象"),
+        ("42", "顶层应为 JSON 对象"),
+        ("", "JSON 语法错误"),
+    ],
+)
+def test_the_type_check_leaves_the_other_three_alone(tmp_path, text, expected):
+    """三种既有检疫行为不能被这次扩展破坏（它们各有自己的用例）。"""
+    server, folder = server_with_config_file(tmp_path, text)
+    slf._language = "zh_cn"
+
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert reason is not None and expected in reason, reason
+
+
+def test_a_non_utf8_config_is_still_handled_by_the_decode_path(tmp_path):
+    """第四种「写坏」仍然走解码那条路，不会被类型层抢走。"""
+    payload = '{"patterns": ["中文规则"]}'.encode("gbk")
+    server, folder = server_with_raw_config(tmp_path, payload)
+    slf._language = "zh_cn"
+
+    reason = slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert reason is not None and "UTF-8" in reason, reason
+
+
+# ---------------------------------------------------------------------------
+#  20. 语言探测失败要留痕（SLF-06）
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_language_probe_is_reported_not_swallowed():
+    """两处 ``except Exception: pass`` 静默吞掉了可诊断的失败。
+
+    构造：``get_mcdr_language`` 与 ``get_mcdr_config`` 都抛。旧实现下
+    ``language: auto`` 会安静地退到 en_us，日志里一个字都没有——中文管理员突然
+    看到英文消息却无从查起。现在要有一条 warning 把 API 名与异常说清楚。
+    """
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+
+    def boom():
+        raise RuntimeError("no language for you")
+
+    server.get_mcdr_language = boom
+    server.get_mcdr_config = boom
+    slf.on_load(server, None)
+
+    assert slf._language == i18n.FALLBACK_LANGUAGE
+    warnings = "\n".join(server.logger.warnings)
+    assert "get_mcdr_language" in warnings, warnings
+    assert "RuntimeError" in warnings, warnings
+    assert "no language for you" in warnings, warnings
+
+
+def test_a_working_language_probe_stays_silent():
+    """正常路径上一个字都不该多说。"""
+    server = FakePluginServer(config_data={"patterns": [LIVE]}, mcdr_language="en_us")
+    slf.on_load(server, None)
+    assert slf._language == "en_us"
+    assert not any("MCDR" in m and "语言" in m for m in server.logger.warnings)
+
+
+def test_a_diagnostic_from_one_call_does_not_leak_into_the_next():
+    """诊断收集在**本次调用的上下文**里，不是模块全局。"""
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+
+    def boom():
+        raise RuntimeError("first failure")
+
+    server.get_mcdr_language = boom
+    server.get_mcdr_config = boom
+    slf.on_load(server, None)
+    first = len(server.logger.warnings)
+    assert first >= 1
+
+    server.get_mcdr_language = lambda: "en_us"
+    server.get_mcdr_config = lambda: {"language": "en_us"}
+    slf.on_load(server, None)
+    assert len(server.logger.warnings) == first, "第二次不该重复上一次的诊断"
+    assert slf._language == "en_us"
+
+
+def test_the_language_file_listing_failure_is_also_reported(monkeypatch):
+    """``i18n._list_lang_files`` 的 ``except Exception: pass`` 同样要留痕。
+
+    两条退路都堵上：loader 那条抛异常，纯文件系统那条指向一个不存在的目录
+    （不直接 monkeypatch ``os.listdir``——那会连带影响 pytest 自己）。
+    诊断经 ``_note`` 走上下文，所以这里显式建一个上下文，模拟插件当时的处境。
+    """
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("loader exploded")
+
+    monkeypatch.setattr(i18n.importlib.resources, "files", boom)
+    monkeypatch.setattr(i18n, "_filesystem_dir", lambda: str(REPO / "no-such-folder"))
+    notes = {}
+    token = slf._notes.set(notes)
+    try:
+        i18n.available_languages(notes)
+    finally:
+        slf._notes.reset(token)
+
+    assert notes, "两条退路都失败时必须留下诊断"
+    assert any("loader exploded" in note for note in notes.values()), notes
+    assert any("os.listdir" in note for note in notes.values()), notes
+
+
+def test_the_listing_failure_reaches_a_console_warning(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("loader exploded")
+
+    monkeypatch.setattr(i18n.importlib.resources, "files", boom)
+    monkeypatch.setattr(i18n, "_filesystem_dir", lambda: str(REPO / "no-such-folder"))
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    warnings = "\n".join(server.logger.warnings)
+    assert "loader exploded" in warnings, warnings
+    assert "os.listdir" in warnings, warnings
+
+
+def test_a_message_whose_placeholder_is_named_like_a_parameter_still_formats():
+    """``language.detect_failed_summary`` 的占位符就叫 ``language``。
+
+    而 ``translate(key, language, **kwargs)`` 的第二个参数也叫 ``language``：把它当
+    关键字传进去会撞名（TypeError），不传又会让占位符原样留下。所以走
+    ``translate_values`` 的映射形式。这条用例钉住"不许再退回未格式化的模板"。
+    """
+    text = i18n.translate_values(
+        "language.detect_failed_summary",
+        "en_us",
+        {"count": 2, "language": "en_us", "details": "boom"},
+    )
+    assert "{count}" not in text and "{language}" not in text and "{details}" not in text
+    assert "2 failure(s)" in text and "en_us" in text and "boom" in text
+
+
+def test_no_message_reaches_the_console_with_unfilled_placeholders():
+    """跨用例的守卫：探测失败那条警告必须真的格式化过。
+
+    本用例在一次真实 ``on_load`` 之后检查控制台文案，任何 ``{name}`` 残留都算失败——
+    这一类 bug 的表现正是"消息看起来没坏，只是读起来像模板"。
+    """
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+
+    def boom():
+        raise RuntimeError("no language for you")
+
+    server.get_mcdr_language = boom
+    server.get_mcdr_config = boom
+    slf.on_load(server, None)
+
+    for message in server.logger.warnings + server.logger.errors:
+        leftover = re.findall(r"\{[a-z_][a-z_0-9]*\}", message)
+        assert not leftover, "未填充的占位符 {}: {}".format(leftover, message)
+
+
+# ---------------------------------------------------------------------------
+#  21. state.json 的隔离与并发（SLF-08）
+# ---------------------------------------------------------------------------
+
+STATE_PAYLOAD = json.dumps(
+    {
+        "session_index": 3,
+        "rules": {IDLE: {"hits_last_session": 0, "zero_streak": 3,
+                         "total_hits": 0, "last_hit_session": 0}},
+    }
+)
+
+
+def test_a_broken_state_file_is_backed_up_not_silently_reset(tmp_path):
+    """SLF-08：只有 config.json 有备份 + 播报，state.json 损坏会被静默重置。"""
+    server, folder = server_with_config_file(tmp_path, json.dumps({"patterns": [LIVE]}))
+    (folder / slf.STATE_FILE_NAME).write_text("{ truncated", encoding="utf-8")
+    slf._language = "zh_cn"
+
+    reason = slf._quarantine_broken_state(server, slf.STATE_FILE_NAME)
+
+    assert reason is not None
+    backup = folder / (slf.STATE_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)
+    assert backup.is_file(), "损坏的 state.json 必须留一份 .old"
+    assert backup.read_text(encoding="utf-8") == "{ truncated"
+    assert any("state.json" in m for m in server.logger.warnings), server.logger.warnings
+
+
+def test_a_type_broken_state_file_is_backed_up_too(tmp_path):
+    server, folder = server_with_config_file(tmp_path, json.dumps({"patterns": [LIVE]}))
+    (folder / slf.STATE_FILE_NAME).write_text(
+        json.dumps({"session_index": "three"}), encoding="utf-8"
+    )
+    slf._language = "zh_cn"
+
+    reason = slf._quarantine_broken_state(server, slf.STATE_FILE_NAME)
+
+    assert reason is not None
+    assert (folder / (slf.STATE_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)).is_file()
+
+
+def test_a_sound_state_file_is_left_alone(tmp_path):
+    server, folder = server_with_config_file(tmp_path, json.dumps({"patterns": [LIVE]}))
+    (folder / slf.STATE_FILE_NAME).write_text(STATE_PAYLOAD, encoding="utf-8")
+
+    assert slf._quarantine_broken_state(server, slf.STATE_FILE_NAME) is None
+    assert not (folder / (slf.STATE_FILE_NAME + slf.CONFIG_BACKUP_SUFFIX)).exists()
+    assert server.logger.warnings == []
+
+
+def test_a_missing_state_file_is_not_an_error(tmp_path):
+    server, folder = server_with_config_file(tmp_path, json.dumps({"patterns": [LIVE]}))
+    assert slf._quarantine_broken_state(server, slf.STATE_FILE_NAME) is None
+    assert server.logger.warnings == []
+
+
+def test_loading_the_state_checks_the_file_first(tmp_path):
+    """接线守卫：检疫必须在真正的加载路径上被调用。"""
+    server, folder = server_with_config_file(tmp_path, json.dumps({"patterns": [LIVE]}))
+    (folder / slf.STATE_FILE_NAME).write_text("{ truncated", encoding="utf-8")
+    seen = []
+    original = slf._quarantine_broken_state
+
+    def spy(srv, name):
+        seen.append(name)
+        return original(srv, name)
+
+    slf._quarantine_broken_state = spy
+    try:
+        slf._load_state(server)
+    finally:
+        slf._quarantine_broken_state = original
+
+    assert seen == [slf.STATE_FILE_NAME]
+
+
+def test_the_state_lock_is_a_single_shared_mutex():
+    """``_state`` 的读改写必须共用同一把锁（不是每次新建一把）。
+
+    各线程如果各自拿到一把不同的锁，等于没有互斥。
+    """
+    seen = []
+    for _ in range(12):
+        seen.append(id(slf._state_mutex()))
+    assert len(set(seen)) == 1, seen
+
+
+def test_state_updates_take_the_module_lock():
+    """写路径必须在锁里：否则主线程结算与命令线程改动能互相覆盖。
+
+    做法：先自己占住 ``_state_mutex()``，再从**另一个线程**调用结算路径。它如果
+    真的在关键区里，就会被这把锁挡住。变异检查里有对应锚点——把 ``with
+    _state_mutex():`` 从 ``_update_state_after_session`` 里去掉，这条用例必须变红。
+    """
+    import threading as _threading
+
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    result = []
+    holder = slf._state_mutex()
+    holder.acquire()
+    try:
+        def attempt():
+            slf._update_state_after_session(server, slf._state, [], [IDLE])
+            result.append("ran without the lock")
+
+        thread = _threading.Thread(target=attempt, name="attempt")
+        thread.start()
+        thread.join(timeout=1.5)
+        assert result == [], (
+            "结算路径没等 ``_state_mutex()``，说明它不在关键区里"
+        )
+        assert thread.is_alive(), "线程本该被锁挡住"
+    finally:
+        holder.release()
+
+    thread.join(timeout=10)
+    assert result == ["ran without the lock"]
+    assert slf._state.session_index == 1
+
+
+def test_concurrent_sessions_through_the_real_entry_points_do_not_lose_updates():
+    """SLF-17：多线程跑真实的 ``on_server_stop`` 结算路径。
+
+    线程数 = 结算次数是这里唯一的不变式（``zero_streak`` 只增不减）。少一次就说明
+    ``_update_state_after_session`` 里的读改写被并发吃掉了——也就是锁被拿掉后的表现。
+    """
+    import threading as _threading
+
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    rounds = 60
+    errors = []
+
+    def settle():
+        try:
+            # 只有"这一轮完成过启动"才会结算；每个线程自己置位，模拟各自的一轮。
+            slf._session_reached_startup = True
+            slf._update_state_after_session(
+                server, slf._state, list(slf._log_filter.rules), [IDLE]
+            )
+        except Exception as error:  # noqa: BLE001 - 记下来而不是让线程静默死掉
+            errors.append(error)
+
+    threads = [
+        _threading.Thread(target=settle, name="settle-{}".format(i))
+        for i in range(rounds)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    assert slf._state.session_index == rounds, (
+        "并发结算丢了更新: {} != {}".format(slf._state.session_index, rounds)
+    )
+    assert slf._state.rules[IDLE].zero_streak == rounds
+
+
+def test_concurrent_state_writers_do_not_lose_updates():
+    """锁本身的压力测试：8 线程各跑 200 次读改写，一次都不能丢。"""
+    import threading as _threading
+
+    state = slf.State()
+    rounds = 200
+    barrier = _threading.Barrier(8)
+
+    def settle():
+        barrier.wait()
+        for _ in range(rounds):
+            with slf._state_mutex():
+                state.session_index += 1
+                entry = state.rules.setdefault(IDLE, slf.RuleState())
+                entry.zero_streak += 1
+
+    threads = [_threading.Thread(target=settle, name="settle-{}".format(i))
+               for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert state.session_index == 8 * rounds
+    assert state.rules[IDLE].zero_streak == 8 * rounds
+
+
+def test_concurrent_filtering_and_command_reloads_keep_the_statistics_sane():
+    """SLF-17：真实入口的并发小规模压测（主线程过滤 + 命令线程改动）。
+
+    主线程逐行过滤的同时，命令线程反复 ``!!lf reload`` 与 ``!!lf list``。断言的是
+    **不变式**而不是精确计数（重载会把计数按 pattern 接续，所以总数在换规则时会变）：
+    规则集合始终完整、状态文件始终可反序列化、总量非负、每轮都有结算。
+    """
+    import threading as _threading
+
+    server = start_plugin(config={"patterns": [LIVE, IDLE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+
+    stop = _threading.Event()
+    errors = []
+
+    def filter_lines():
+        try:
+            while not stop.is_set():
+                slf._log_filter.filter_server_info(
+                    FakeInfo("Player Steve standing on air - force-sending blocks below")
+                )
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    def command_thread():
+        try:
+            while not stop.is_set():
+                slf._show_status(FakeSource())
+                server.config_data = {"patterns": [LIVE, IDLE], "stale_rule_threshold": 1}
+                slf._apply_config(server)
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    producers = [_threading.Thread(target=filter_lines, name="filter-{}".format(i))
+                 for i in range(3)]
+    commanders = [_threading.Thread(target=command_thread, name="cmd-{}".format(i))
+                  for i in range(2)]
+    for thread in producers + commanders:
+        thread.start()
+    _threading.Event().wait(0.4)
+    stop.set()
+    for thread in producers + commanders:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    assert {r.pattern for r in slf._log_filter.rules} == {LIVE, IDLE}
+    counts = slf._log_filter.counted_hits()
+    assert len(counts) == len(slf._log_filter.rules)
+    assert all(isinstance(count, int) and count >= 0 for count in counts), counts
+    assert slf._log_filter.total >= 0
+    # 状态文件在任何交错下都必须仍是可反序列化的合法结果
+    saved = json.loads(json.dumps(slf._state.serialize()))
+    assert slf.State.deserialize(saved).serialize() == saved
+
+def test_the_status_screen_works_on_local_snapshots():
+    """SLF-12：三个模块级列表在命令线程被整体重建，状态页必须读快照。
+
+    这里在状态页执行到一半时替换掉那三个列表（模拟一次交错的 ``!!lf reload``），
+    断言它印出来的仍然是开始那一刻的那一版。
+    """
+    server = start_plugin(config={"patterns": ["."]})       # "." 会进 _warned_patterns
+    del server
+    assert slf._warned_patterns, "前置条件：需要一条被警告的规则"
+
+    real_field = slf._field
+    observed = []
+
+    def spy(label, value, value_colour=None):
+        if "匹配一切" in label:
+            observed.append(str(value))
+            # 就在"读取"和"渲染"之间，另一个线程重建了列表
+            slf._warned_patterns = ["a-later-pattern", "another"]
+        return real_field(label, value) if value_colour is None else real_field(
+            label, value, value_colour
+        )
+
+    slf._field = spy
+    try:
+        slf._show_status(FakeSource())
+    finally:
+        slf._field = real_field
+
+    assert observed == ["1 条规则（会隐去所有输出，请检查是不是写成了 . / .* / ^ 之类）"], (
+        "状态页读的是被换掉之后的新列表，说明没有取快照: {}".format(observed)
+    )
+
+
+# ---------------------------------------------------------------------------
+#  22. 单引号、空行规则与 reload 兜底（SLF-14 / SLF-15）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        ('"language": "en_us"', "en_us"),
+        ("'language': 'en_us'", "en_us"),
+        ('"language":  "zh_cn" ', "zh_cn"),
+        ("'language' : 'zh_tw'", "zh_tw"),
+    ],
+)
+def test_the_raw_string_reader_accepts_both_quote_styles(line, expected):
+    """SLF-14①：严格 JSON 里字符串只能用双引号，但这段原文**本来就是写坏的文件**。
+
+    只认双引号会让手写时混进单引号的文件读不到 language，语言悄悄退回 auto。
+    """
+    raw = "{\n    " + line + "\n}\n"
+    assert slf._raw_str_option(raw, slf.LANGUAGE_OPTION) == expected
+
+
+def test_the_raw_string_reader_still_returns_none_when_absent():
+    assert slf._raw_str_option("{}", slf.LANGUAGE_OPTION) is None
+    assert slf._raw_str_option('{"patterns": []}', slf.LANGUAGE_OPTION) is None
+
+
+def test_a_single_quoted_language_survives_a_broken_config(tmp_path):
+    """端到端：写坏的配置里用单引号写的 language 也要被读到。"""
+    text = "{\n    'language': 'en_us',\n    \"patterns\": [\n        \"a\"\n        \"b\"\n    ]\n}\n"
+    server, folder = server_with_config_file(tmp_path, text)
+    slf._quarantine_broken_config(server, slf.CONFIG_FILE_NAME)
+
+    assert any("cannot be parsed" in m for m in server.logger.errors), (
+        "播报应当用文件里写的 en_us，而不是 MCDR 的 zh_cn: {}".format(server.logger.errors)
+    )
+
+
+@pytest.mark.parametrize("pattern", [r"^$", r"(?m)^$", r"^$|^$"])
+def test_a_rule_that_hides_every_blank_line_is_flagged(pattern):
+    """SLF-14②：只匹配空行的规则（``^$``）以前不会被 catch-all 守卫标记。
+
+    发现里建议"往样本集加一个空串"，但那个办法是错的：``_matches_everything`` 用的是
+    ``all(...)``，而 `.` / `.+` / `\\S` 这些真正的 catch-all 本来就不匹配空串，
+    加进去只会把它们全部漏报。所以这里用**补集**单独判：匹配空串、且一个非空样本都
+    不匹配。
+    """
+    regex = re.compile(pattern)
+    assert slf._hides_every_blank_line(regex), pattern
+    assert not slf._matches_everything(regex), "它不是 catch-all，不该走那条判据"
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [LIVE, IDLE, r"\w", r"\d+", "joined the game", r"^\[", "error|warn", "玩家"],
+)
+def test_the_blank_line_rule_does_not_catch_normal_patterns(pattern):
+    assert not slf._hides_every_blank_line(re.compile(pattern)), pattern
+
+
+def test_a_blank_line_rule_is_kept_and_warned_like_a_catch_all():
+    server = start_plugin(config={"patterns": [r"^$", LIVE]})
+    assert len(slf._log_filter.rules) == 2, "仍然保留（不是被拒）"
+    assert slf._warned_patterns == [r"^$"], slf._warned_patterns
+    assert slf._rejected_patterns == []
+    assert any("匹配一切" in w for w in server.logger.warnings)
+
+
+def test_the_catch_all_subject_set_still_has_no_empty_string():
+    """把空串塞回样本集会让 `.` / `.+` 漏报——这条用例把它钉住。"""
+    assert "" not in slf.CATCH_ALL_SUBJECTS
+    assert slf._matches_everything(re.compile("."))
+    assert slf._matches_everything(re.compile(".+"))
+
+
+def test_the_reload_command_replies_instead_of_raising():
+    """SLF-15①：``!!reload`` 没有异常兜底（同一个文件的 ``reset`` 有）。"""
+    server = start_plugin(config={"patterns": [LIVE]})
+
+    def boom(_server):
+        raise RuntimeError("simulated reload failure")
+
+    slf._apply_config = boom
+    source = FakeSource()
+    try:
+        slf._reload(source)                     # 不允许抛出去
+    finally:
+        del slf._apply_config
+
+    text = "".join(str(x) for x in source.replies)
+    assert text, "管理员必须得到一条回复，而不是只有一条 traceback"
+    assert "重载失败" in text, text
+    assert "simulated reload failure" in text, text
+    logged = "\n".join(server.logger.exceptions)
+    assert "simulated reload failure" in logged, (
+        "MCDR 日志里也要有完整堆栈；实际记录到的是 {!r}".format(logged)
+    )
+
+
+def test_the_test_command_handles_a_prefix_only_line():
+    """SLF-15②：只粘贴前缀时，``sub(...) or text`` 会退回带前缀的原文。
+
+    那时 ``^`` 锚定的规则被报成「不命中」，而真实过滤时该行会被剥掉前缀后匹配——
+    结论正好相反。剥完是空串就应当按空串测。
+    """
+    start_plugin(config={"patterns": [r"^$"]})
+    source = FakeSource()
+    slf._test_line(source, {"text": "[12:00:00] [Server thread/INFO]: "})
+
+    text = "".join(str(x) for x in source.replies)
+    assert "命中规则" in text, text
+    assert "不匹配" not in text, text
+
+
+def test_the_test_command_still_reports_a_real_miss():
+    """显式判断不能把"真正不命中"也一起说成命中。"""
+    start_plugin(config={"patterns": [r"^$"]})
+    source = FakeSource()
+    slf._test_line(source, {"text": "Steve joined the game"})
+
+    text = "".join(str(x) for x in source.replies)
+    assert "不匹配" in text, text
+
+
+def test_the_test_command_leaves_text_without_a_prefix_alone():
+    start_plugin(config={"patterns": [LIVE]})
+    source = FakeSource()
+    slf._test_line(source, {"text": SHADOW_LINE})
+
+    text = "".join(str(x) for x in source.replies)
+    assert "命中规则" in text
+    assert "前缀" not in text, "没有前缀就不该说剥掉了前缀"
+
+
+# ---------------------------------------------------------------------------
+#  23. 次级缺口（A1 §4）
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_runs_for_every_pattern_in_a_list():
+    """探测必须逐条跑，不能只测第一条。"""
+    server = FakePluginServer()
+    rules = slf._build_rules(server, [LIVE, r"(a+)+$", "joined the game"])
+    assert [r.pattern for r in rules] == [LIVE, "joined the game"]
+
+
+def test_the_state_file_is_not_written_by_the_per_line_path():
+    """逐行热路径仍然不碰状态文件（与 test_state_tracking_* 同一承诺的另一半）。"""
+    server = start_plugin(config={"patterns": [LIVE], "stale_rule_threshold": 1})
+    slf.on_server_start(server)
+    slf.on_server_startup(server)
+    server.saved.clear()
+
+    for _ in range(20):
+        slf._log_filter.filter_server_info(FakeInfo(SHADOW_LINE))
+    assert server.saved == {}
+
+
+def test_on_load_can_run_twice_without_error():
+    """同一个模块上连续两次 on_load（真实重载会新建模块，测试里不会）也不该抛。"""
+    server = FakePluginServer(config_data={"patterns": [LIVE]})
+    slf.on_load(server, None)
+    first = slf._log_filter
+    slf.on_load(server, None)
+    assert slf._log_filter is not first
+    assert [r.pattern for r in slf._log_filter.rules] == [LIVE]
+
+
+def test_a_command_run_before_on_load_replies_and_does_not_raise():
+    """命令面在插件尚未初始化时必须给一句可读回复。"""
+    saved = (slf._server, slf._state, slf._log_filter)
+    slf._server = slf._state = slf._log_filter = None
+    try:
+        for command in (slf._reload, slf._reset_streaks, slf._show_status):
+            source = FakeSource()
+            command(source)
+            assert source.replies, command
+            assert "尚未初始化" in "".join(str(x) for x in source.replies)
+    finally:
+        slf._server, slf._state, slf._log_filter = saved
+
+
+
+
+

@@ -1,0 +1,24 @@
+# Linting, for the code that ships and the code that tests it.
+#
+# The selection is deliberately narrow, and B904's fix is the only one that ever fired in the
+# release script. A broad selection would mostly generate a diff: this repository's style is
+# already consistent on purpose.
+#
+# * ``target-version`` is 3.9, which is the floor the READMEs declare. Nothing may be
+#   suggested that a 3.9 interpreter cannot run, which is also why the annotations are
+#   ``typing.List`` / ``typing.Optional`` rather than the builtin generics, and why f-strings
+#   are used only where 3.6 already allowed them. ``UP`` would be wrong to enforce here.
+#
+# What is on: the four default families — imports, statement-level errors, runtime errors and
+# pyflakes — plus bugbear's genuine bug patterns: raise without ``from`` inside an except,
+# closures capturing a loop variable, unbound locals, mutable class defaults.
+
+target-version = "py39"
+
+# Checked in from the repository root, so the local copy of MCDR and pytest that
+# ``pip install --target .testlibs`` leaves behind has to be kept out of the walk — otherwise
+# the same command reports thousands of issues in somebody else's code and none of ours.
+extend-exclude = [".testlibs", "dist", "Releases"]
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B"]

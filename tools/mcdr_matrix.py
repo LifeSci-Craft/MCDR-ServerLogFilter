@@ -30,6 +30,7 @@ The plugin version tested is whatever ``mcdreforged.plugin.json`` says; the
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -100,12 +101,71 @@ def build_plugin() -> Path:
     return out
 
 
+def _interpreter_has_own_mcdr(python: str) -> bool:
+    probe = subprocess.run(
+        [python, "-c", "import mcdreforged"],
+        capture_output=True,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        timeout=120,
+    )
+    return probe.returncode == 0
+
+
+def child_env(python: str) -> dict:
+    """The environment to start MCDR (and, through it, the fake server) in.
+
+    Two things have to be right, and getting either wrong is silent:
+
+    * ``.testlibs`` may be the only place MCDR exists — the CI layout, where the interpreter has
+      nothing but pytest. Then it must be on ``PYTHONPATH``, and it must be an **absolute** path:
+      the instance runs in a temporary directory, so a relative ``.testlibs`` stops resolving
+      there and MCDR dies with "No module named mcdreforged" — which reads like a broken plugin
+      rather than a broken path.
+    * If the interpreter has its own MCDR (the local layout of one virtualenv per version), the
+      inherited ``PYTHONPATH`` must be **dropped**: it precedes site-packages, so a
+      ``.testlibs/mcdreforged`` would shadow the version being tested and the matrix would
+      report "several versions pass" while running one of them several times.
+
+    The probe decides, once per interpreter.
+    """
+    env = dict(os.environ)
+    testlibs = REPO / ".testlibs"
+
+    if not testlibs.is_dir() or _interpreter_has_own_mcdr(python):
+        env.pop("PYTHONPATH", None)
+        return env
+
+    existing = env.get("PYTHONPATH", "")
+    parts = [str(testlibs)] + [part for part in existing.split(os.pathsep) if part]
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
 def mcdr_version(python: str) -> str:
     proc = subprocess.run(
         [python, "-c", "import mcdreforged;print(mcdreforged.__version__)"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+        env=child_env(python),
     )
     return proc.stdout.strip() or "unknown"
+
+
+def catalogue() -> dict:
+    """The shipped Chinese catalogue, read rather than quoted.
+
+    Every assertion below that looks for a *sentence* reads it from here. The alternatives are
+    two failures this file has already had: a phrase written down here goes stale the moment the
+    message is reworded (the stale-rule warning was reworded from "连续 N 次零命中" to "从未命中"
+    and this tool started reporting "the warning never appeared"), and a phrase written in the
+    plugin's own file is not something this tool should own. Read from the artifact's source of
+    truth, exactly like ``plugin_badge()`` reads the name.
+    """
+    path = REPO / "server_log_filter" / "lang" / "zh_cn.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def phrase(key: str, **kwargs) -> str:
+    return catalogue()[key].format(**kwargs)
 
 
 def run_one(python: str, plugin: Path, workdir: Path) -> dict:
@@ -143,13 +203,14 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
                          "total_hits": 0, "last_hit_session": 0}},
     }, indent=2))
 
+    env = child_env(python)
     subprocess.run([python, "-m", "mcdreforged", "init"], cwd=str(root),
-                   capture_output=True, timeout=180)
+                   capture_output=True, timeout=180, env=env)
 
     proc = subprocess.Popen([python, "-m", "mcdreforged"], cwd=str(root),
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace")
+                            encoding="utf-8", errors="replace", env=env)
     lines, stopping_at = [], None
     started = time.time()
     try:
@@ -177,7 +238,10 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
     loaded = "已启用 3 条日志过滤规则" in out
     dep_blocked = "不满足版本约束" in out
     done_at = out.find(STARTUP_LINE)
-    warn_at = out.find("都没有命中")
+    # One stale rule, and the seeded config sets ``stale_rule_threshold`` to THRESHOLD, so the
+    # warning header interpolates to exactly this sentence.
+    warning_marker = phrase("stale.title", count=1, threshold=THRESHOLD)
+    warn_at = out.find(warning_marker)
 
     state_path = root / "config" / PLUGIN_ID / "state.json"
     state = {}
@@ -205,9 +269,9 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
         "warning_names_rule": IDLE in out,
         # The idle streak lives in the header, not per rule. The seeded streak (5)
         # exceeds the threshold (2), so this rule does get the short annotation.
-        "warning_states_streak_once": out.count("都没有命中") == 1,
-        "warning_annotates_longer_streak": "（已连续 {} 次零命中）".format(
-            SEEDED_SESSION
+        "warning_states_streak_once": out.count(warning_marker) == 1,
+        "warning_annotates_longer_streak": phrase(
+            "stale.entry_extra", streak=SEEDED_SESSION
         ) in out,
         "state_written": bool(state.get("session_index")),
         "session_advanced": state.get("session_index") == SEEDED_SESSION + 1,

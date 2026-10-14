@@ -23,6 +23,7 @@ import importlib.resources
 import json
 import os
 import pkgutil
+import threading
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence
 
 
@@ -94,27 +95,56 @@ def _resource_bytes(relative: str) -> Optional[bytes]:
         return None
 
 
-def _list_lang_files() -> List[str]:
-    """File names in the package's ``lang`` folder, empty if it cannot be listed."""
+def _list_lang_files(notes: Optional[Dict[str, str]] = None) -> List[str]:
+    """File names in the package's ``lang`` folder, empty if it cannot be listed.
+
+    ``notes`` is an optional bucket the caller passes in so a failure of the *loader*
+    path is not swallowed without a trace: it used to be a bare ``except Exception:
+    pass``, which meant a broken loader silently degraded the plugin to raw message
+    keys with nothing in the log. The exception is still swallowed (this is a probe --
+    it must never take the plugin down) but it is now observable.
+
+    The bucket is filled through the plugin's ``_note`` helper (imported lazily to keep
+    this module free of an import cycle), so entries arrive already translated and
+    formatted and the caller only has to join them.
+    """
+
+    def record(key: str, error: BaseException) -> None:
+        if notes is None:
+            return
+        detail = "{}: {}".format(type(error).__name__, error)
+        # Prefer the plugin's ``_note`` so the entry gets translated right away (see the
+        # docstring). It is only reachable while the plugin has set up its contextvar;
+        # a standalone caller of this module gets the untranslated form, not silence.
+        try:
+            from . import _note
+
+            _note("language.list_failed", key, api=key, error=detail)
+        except TypeError:  # 没有 _note（单独 import 本模块）或没有活动上下文
+            notes[key] = "{} failed (api={}, error={})".format(key, key, detail)
+
     try:
         folder = importlib.resources.files(__package__).joinpath(LANG_DIR_NAME)
         return sorted(entry.name for entry in folder.iterdir())
-    except Exception:  # noqa: BLE001 - any loader quirk falls back to the plain path
-        pass
+    except Exception as error:  # noqa: BLE001 - loader quirks fall back to the plain path
+        record("importlib.resources", error)
     try:
         return sorted(os.listdir(os.path.join(_filesystem_dir(), LANG_DIR_NAME)))
-    except OSError:
+    except OSError as error:
+        record("os.listdir", error)
         return []
 
 
-def available_languages() -> List[str]:
+def available_languages(notes: Optional[Dict[str, str]] = None) -> List[str]:
     """Every shipped language code, sorted.
 
     Read from the package rather than hardcoded: dropping in a ``<code>.json`` is enough
     to make it selectable.
     """
     codes = sorted(
-        os.path.splitext(name)[0] for name in _list_lang_files() if name.endswith(".json")
+        os.path.splitext(name)[0]
+        for name in _list_lang_files(notes)
+        if name.endswith(".json")
     )
     return codes or [FALLBACK_LANGUAGE]
 
@@ -128,7 +158,12 @@ def normalize(code: Any) -> str:
 
 # Catalogue cache. Keyed by language; also holds failures, so a file that fails to parse
 # is reported once rather than on every message.
+#
+# Guarded by ``_CATALOGS_LOCK``: the main thread reads catalogues while filtering lines
+# (``log_matched_lines``) and command threads read/write them at the same time, and a
+# plain dict read racing with an insert is not something to leave to CPython's GIL.
 _CATALOGS: Dict[str, Catalog] = {}
+_CATALOGS_LOCK = threading.Lock()
 
 
 def relative_catalog_path(language: str) -> str:
@@ -163,20 +198,22 @@ def get_catalog(language: str) -> Catalog:
                 )
             else:
                 catalog = Catalog({}, "the catalogue must be a JSON object")
-    _CATALOGS[language] = catalog
-    return catalog
+    with _CATALOGS_LOCK:
+        # ``setdefault`` rather than a plain store: two threads may have raced on the
+        # same language, and both results are equally valid -- the first one wins so the
+        # cache stays a pure function of the file.
+        return _CATALOGS.setdefault(language, catalog)
 
 
 def clear_cache() -> None:
     """Forget every loaded catalogue (used by the tests)."""
-    _CATALOGS.clear()
+    with _CATALOGS_LOCK:
+        _CATALOGS.clear()
 
 
 def translate(key: str, language: str = FALLBACK_LANGUAGE, **kwargs: Any) -> str:
     """``key`` in ``language`` → the default language → the key itself."""
-    template = get_catalog(language).messages.get(key)
-    if template is None and language != FALLBACK_LANGUAGE:
-        template = get_catalog(FALLBACK_LANGUAGE).messages.get(key)
+    template = _find_template(key, language)
     if template is None:
         return key
     if not kwargs:
@@ -188,6 +225,31 @@ def translate(key: str, language: str = FALLBACK_LANGUAGE, **kwargs: Any) -> str
         # a reason to fail the caller: show it as written so the mistake is visible.
         # AttributeError matters too: ``{a.b}`` in a translation is a plain typo, and it
         # would otherwise escape this function and contradict the promise above.
+        return template
+
+
+def _find_template(key: str, language: str) -> Optional[str]:
+    """The template for ``key`` in ``language``, or the fallback catalogue's, or None."""
+    template = get_catalog(language).messages.get(key)
+    if template is None and language != FALLBACK_LANGUAGE:
+        template = get_catalog(FALLBACK_LANGUAGE).messages.get(key)
+    return template
+
+
+def translate_values(key: str, language: str, values: Dict[str, Any]) -> str:
+    """Like ``translate`` but takes the substitutions as a mapping.
+
+    Needed whenever one of the substitutions is **also a parameter name of
+    ``translate`` itself** — ``language`` in ``language.detect_failed_summary``. Passing
+    it as a keyword to ``translate()`` collides and raises ``TypeError``, while dropping
+    it leaves the placeholder unformatted; the mapping form is the way through.
+    """
+    template = _find_template(key, language)
+    if template is None:
+        return key
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError):
         return template
 
 
@@ -217,14 +279,18 @@ def resolve(
     setting: Any,
     mcdr_language: Any = None,
     available: Optional[Sequence[str]] = None,
+    notes: Optional[Dict[str, str]] = None,
 ) -> Choice:
     """Work out which language to speak (matching rules: docs/DEVELOPMENT.md).
 
     :param setting: the plugin's ``language`` option — ``auto`` (or blank) follows MCDR.
     :param mcdr_language: MCDR's own language, used when ``setting`` is ``auto``.
     :param available: override the shipped language list (only the tests do this).
+    :param notes: optional bucket that collects probe failures (see ``_list_lang_files``).
     """
-    languages = list(available) if available is not None else available_languages()
+    languages = (
+        list(available) if available is not None else available_languages(notes)
+    )
     wanted = normalize(setting)
 
     if wanted in ("", AUTO):

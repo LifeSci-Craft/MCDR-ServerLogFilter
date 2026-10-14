@@ -35,6 +35,7 @@ them out cuts roughly half off the artifact. ``server_log_filter/lang/README.md`
 import ast
 import io
 import json
+import re
 import sys
 import tokenize
 import zipfile
@@ -49,6 +50,9 @@ SRC = Path(__file__).resolve().parent
 # "this timestamp carries no information".
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
+#: Trimmed to its latest section on the way into the artifact (see ``packaged_changelog``).
+CHANGELOG_NAME = "CHANGELOG.md"
+
 # Root-level files that ship with the plugin.
 #
 # README.md / README_en.md are intentionally absent: MCDR never reads them, they
@@ -56,7 +60,7 @@ FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 ROOT_FILES = {
     "mcdreforged.plugin.json",
     "LICENSE",
-    "CHANGELOG.md",
+    CHANGELOG_NAME,
 }
 
 # Code package: same name as the plugin id.
@@ -69,6 +73,16 @@ PACKAGE_NAME = "server_log_filter"
 PACKAGE_DATA_DIRS = {
     "lang": (".json",),
 }
+
+#: Entries packed as text, and therefore normalised to LF.
+#:
+#: ``.py`` is not listed because ``packaged_source`` already rebuilds it line by line. The rest
+#: are copied as bytes, and their line endings in the working tree depend on the operating
+#: system and on whether anything rewrote them outside git's ``.gitattributes`` filter — which
+#: is how a Windows pack and a Linux pack of the same tag end up with different hashes, and how
+#: "rebuild it from the tag and compare" quietly stops working. Normalising here means the
+#: artifact depends on the source, not on the machine that packed it.
+TEXT_SUFFIXES = (".json", ".md")
 
 
 def _is_package_payload(rel: Path) -> bool:
@@ -180,8 +194,46 @@ def packaged_source(path: Path) -> bytes:
     try:
         compile(stripped, str(path), "exec")
     except SyntaxError as error:  # pragma: no cover - a bug in the stripper
-        raise SystemExit("stripping {} produced invalid code: {}".format(path, error))
+        raise SystemExit(
+            "stripping {} produced invalid code: {}".format(path, error)
+        ) from error
     return stripped.encode("utf-8")
+
+
+def packaged_bytes(path: Path) -> bytes:
+    """The bytes to ship for one non-Python file, with line endings normalised.
+
+    See :data:`TEXT_SUFFIXES` for why the normalisation has to happen here rather than being
+    left to the working tree.
+    """
+    data = path.read_bytes()
+    if path.suffix in TEXT_SUFFIXES:
+        return data.replace(b"\r\n", b"\n")
+    return data
+
+
+#: ``## [1.4.1] - 2026-10-07`` or ``## v1.6.0`` — both spellings name the release.
+_CHANGELOG_HEADING = re.compile(r"^##\s+\[?v?([0-9][0-9A-Za-z.\-]*)\]?")
+
+
+def packaged_changelog(path: Path) -> bytes:
+    """The changelog as it ships: **only the latest release section**.
+
+    The artifact is supposed to carry one release's notes (older ones live on the release
+    page), and the repository file is allowed to keep history as soon as that promise is
+    enforced here rather than by hand. The guard makes an empty or unparsable changelog fail
+    the pack instead of shipping silently.
+    """
+    text = packaged_bytes(path).decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    headings = [index for index, line in enumerate(lines) if _CHANGELOG_HEADING.match(line)]
+    if not headings:
+        raise SystemExit("{} carries no '## <version>' section".format(path.name))
+    if len(headings) > 1:
+        text = "".join(lines[: headings[1]])
+    if sum(1 for line in text.splitlines() if _CHANGELOG_HEADING.match(line)) != 1:
+        raise SystemExit("{} did not trim to a single release".format(path.name))
+    return text.encode("utf-8")
 
 
 def build(out_path: Path) -> Path:
@@ -193,18 +245,28 @@ def build(out_path: Path) -> Path:
         raise SystemExit("mcdreforged.plugin.json must be in the package")
     if not any(p.parent == SRC / PACKAGE_NAME for p in files):
         raise SystemExit(f"{PACKAGE_NAME}/ contains no .py files")
+    # Without a catalogue every message degrades to its raw key, and the artifact still
+    # loads — so the failure would only be noticed by a user.
+    if not any(
+        p.suffix == ".json" and p.parent.name in PACKAGE_DATA_DIRS for p in files
+    ):
+        raise SystemExit("no language catalogues found; every message would be a raw key")
 
     # 压缩级别 9：只影响打包耗时。deflate 的**解压**速度与压缩级别无关
     # （格式没变，只是编码端多花点力气），所以对用户是零开销。
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for path in files:
             rel = path.relative_to(SRC).as_posix()
+            # Comments stay in the repository, where they are useful to read; the artifact
+            # only needs the code. Everything else is normalised to LF so the bytes depend
+            # on the source rather than on the machine that packed them, and the changelog
+            # is trimmed to the release being shipped.
             if path.suffix == ".py":
-                # Comments stay in the repository, where they are useful to read;
-                # the artifact only needs the code.
                 data = packaged_source(path)
+            elif path.name == CHANGELOG_NAME:
+                data = packaged_changelog(path)
             else:
-                data = path.read_bytes()
+                data = packaged_bytes(path)
             # Hand-built ZipInfo rather than zf.write(): mtime, permission bits and host
             # system all have to be pinned, or the same source packs into different bytes
             # on a different day (or a different OS).

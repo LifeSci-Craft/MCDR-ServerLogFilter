@@ -89,7 +89,7 @@
 | `warn_about_stale_rules` | `bool` | `true` | 某条规则连续多个开服周期零命中时提醒一次（只在成功开服的周期上计数） |
 | `stale_rule_threshold` | `int` | `3` | 连续多少个开服周期零命中才提醒；`0` = 关闭这项提醒 |
 | `validate_patterns` | `bool` | `true` | 载入时用短探测串检查灾难性回溯，把这类规则拦下并跳过 |
-| `pattern_probe_timeout_ms` | `int` | `25` | 上面那项检查的耗时上限（毫秒），一般不用改 |
+| `pattern_probe_timeout_ms` | `int` | `25` | 上项检查里**单个探测串**的耗时上限（毫秒）：只影响插件加载与 `!!logfilter reload` 的耗时，与逐行过滤的开销无关（正常规则每行约 1 µs）。小于 1 按 1、大于 2000 按 2000，被钳制时在日志里 warning 一次。**这个检查是启发式**，拦不住所有病态正则（增长比低于阈值、或只在超长输入上才爆发的模式），详见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) |
 | `announce_config_upgrade` | `bool` | `true` | 升级后配置被自动补齐时，在控制台说明新增了哪些选项 |
 | `announce_broken_config` | `bool` | `true` | 配置写坏被备份并重置时，在控制台说明原因与备份路径 |
 

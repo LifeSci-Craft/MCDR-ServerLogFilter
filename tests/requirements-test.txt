@@ -1,5 +1,10 @@
 # Test-only dependencies. Install into a local directory (no venv needed):
 #   python -m pip install --target .testlibs -r tests/requirements-test.txt
+#
 # Pinned to the versions the suite is verified against.
+#
+# These pins need Python >= 3.10 (pytest 9 dropped 3.9), while the plugin itself supports 3.9 —
+# so CI's 3.9 leg installs pytest 8.3.5 by hand instead of this file. The suite was verified
+# under both 9.1.1 and 8.3.5.
 mcdreforged==2.16.0
 pytest==9.1.1

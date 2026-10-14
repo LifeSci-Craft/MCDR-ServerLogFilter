@@ -1,11 +1,12 @@
 {
   "plugin.requires_mcdr": "Server Log Filter requires MCDR >= {version}: this MCDR has no InfoActionFlag, so the plugin is disabled. Please upgrade MCDR and try again.",
   "language.unsupported": "The configured language {value} is not supported; using {fallback} instead. Available values: {options}.",
+  "language.detect_failed": "asking MCDR for its language through {api} raised an exception ({error})",
+  "language.list_failed": "listing the language folder through {api} failed too ({error})",
+  "language.detect_failed_summary": "[ServerLogFilter] Could not detect MCDR's language ({count} failure(s)), so language: auto fell back to {language}: {details}. The MCDR API behind this may have been renamed or disabled; an explicit language setting avoids the guesswork.",
   "catalog.unreadable": "[ServerLogFilter] Could not read the language file {path} ({error}); messages from it will show their raw keys.",
-
   "summary.rules_enabled": "Enabled {count} log filter rule(s); matches are hidden from the MCDR console only, the server log is unaffected",
   "summary.no_rules": "No filter rules are active (patterns is empty, or every rule failed to compile)",
-
   "rule.catch_all": "Filter rule matches everything, kept but please check: {pattern!r} -- it hides **every** line of server output, so the console looks like the server is not running. Usual typos are `.`, `.*`, `^`, `?`, `\\w*`.",
   "rule.duplicate": "Filter rule is a duplicate, only the first one is kept: {pattern!r}",
   "status.warned_label": "Matches all: ",
@@ -15,28 +16,30 @@
   "rule.hidden": "[ServerLogFilter] hidden: {content}",
   "rule.compile_failed": "Filter rule failed to compile, skipped: {pattern!r} ({error})",
   "rule.dangerous": "Filter rule risks catastrophic backtracking, skipped: {pattern!r} -- {detail}. This rule would stall MCDR's main thread on nearly every line; rewrite it as a plain substring or drop the nested quantifier and try again.",
-  "probe.too_slow": "took {cost:.0f} ms on a {length}-character probe string (budget {budget} ms)",
-
+  "probe.too_slow": "took {cost:.0f} ms on a probe string (that length's budget is {budget} ms)",
+  "probe.growth": "cost grows too fast with input length ({cost:.0f} ms, past the growth criterion for the {budget} ms budget tier), the signature of exponential backtracking",
+  "probe.budget_clamped": "[ServerLogFilter] pattern_probe_timeout_ms was set to {given}; it has been clamped into [{minimum}, {maximum}] and is {used} in effect. This value only affects how long loading may spend probing, never the per-line cost.",
   "reload.carried": "Carried over {count} hit(s) from the instance before the reload",
   "reload.carried_session": "; the {count} hit(s) already counted this session are kept",
+  "reload.failed": "[ServerLogFilter] !!logfilter reload failed: {error}",
+  "reload.failed_reply": "Reload failed; the previous rules are still in force. See the MCDR log for details: {error}",
   "session.report": "Hidden {total} server log line(s) from the MCDR console this run (the server log file is unaffected)",
   "help.logfilter": "Server log filter (!!lf): show status / test a line / reload the rules",
-
   "state.save_failed": "Failed to write the filter statistics (state.json)",
   "state.reset_save_failed": "Failed to write state.json",
+  "state.broken_backup": "[ServerLogFilter] state.json could not be read, so it was backed up as {backup} and the plugin continues with empty statistics. The hit history and idle-session counters start counting again from zero.",
   "state.pruned_header": "[ServerLogFilter] Cleared {count} rule statistic(s) from state.json (they are no longer in the configured patterns)",
   "state.pruned_entry": "  - {pattern}",
-
   "upgrade.title": "[ServerLogFilter] Config updated: {count} new option(s) were added and written with their default values",
   "upgrade.entry": "  - {name}  (added in v{since})",
   "upgrade.entry_desc": "      {desc}",
   "upgrade.config_path": "  Config file: {folder}/config.json",
   "upgrade.readme_hint": "  See the \"Configuration\" section of the README for what each one does.",
   "upgrade.no_description": "(no description recorded)",
-
   "broken.json_error": "JSON syntax error: {error}",
   "broken.not_an_object": "the top level should be a JSON object, but it is {kind}",
   "broken.not_utf8": "the file is not valid UTF-8 text (a common cause: it was saved as ANSI/GBK by an editor on Windows)",
+  "broken.bad_types": "the JSON parses, but a field has the wrong type: {error}",
   "broken.backup_failed": "[ServerLogFilter] The config file cannot be parsed, and backing it up to {file}.old failed too ({error}). The original file may have been reset -- please check.",
   "broken.title": "[ServerLogFilter] The config file cannot be parsed; it has been reset to the default config",
   "broken.file_line": "  - The file at fault: {path}",
@@ -46,9 +49,8 @@
   "broken.reload_hint": "    or run !!logfilter reload once you have fixed it.",
   "broken.cause_comma": "  Usual cause: every element of the patterns array needs a comma \",\" between them,",
   "broken.cause_trailing": "              and there must be no trailing comma after the last one.",
-
-  "stale.title": "[ServerLogFilter] Heads up: {count} filter rule(s) have matched nothing for {threshold} or more consecutive sessions",
-  "stale.entry_extra": "   (idle for {streak} sessions)",
+  "stale.title": "[ServerLogFilter] Heads up: {count} filter rule(s) have never matched anything across {threshold} consecutive sessions",
+  "stale.entry_extra": "   (idle for {streak} consecutive sessions)",
   "stale.cause_header": "  There are usually only two explanations:",
   "stale.cause_regex": "    1. The regex is wrong (spelling / case / escaping, or it does not match this server version)",
   "stale.cause_gone": "    2. The log line it targets is no longer produced (e.g. the upstream bug was fixed)",
@@ -57,7 +59,6 @@
   "stale.advice_threshold": "          if it is simply rare, raise stale_rule_threshold,",
   "stale.advice_reset": "          or use !!logfilter reset to clear the counters and start observing again.",
   "stale.note": "  (The reminder itself costs no performance -- it is only there to keep the config clean.)",
-
   "cmd.not_initialised": "The log filter is not initialised yet",
   "cmd.not_initialised_reload": "The plugin is not initialised yet, cannot reload",
   "cmd.not_initialised_reset": "The plugin is not initialised yet, cannot reset",
@@ -77,6 +78,7 @@
   "status.sessions": "{count}",
   "status.rejected_label": "Skipped: ",
   "status.rejected": "{count} rule(s) (bad regex or backtracking risk -- see the MCDR log)",
+  "status.counting_note": "Note: one line can be matched by several rules at once while it is only hidden once, so \"hidden this session\" can be smaller than the sum of the per-rule hit counts.",
   "status.tip_label": "Note: ",
   "status.tip": "the server's own log is unaffected; hidden lines are still dispatched to plugin events.",
   "help.usage": "Usage: {command} <subcommand>  ({alias} works too)",
@@ -97,7 +99,6 @@
   "test.miss": "would not be hidden",
   "test.miss_detail": "    no rule matches this line",
   "test.stripped_note": "(the [time] [thread/level]: prefix was stripped, so this tested the body that is actually matched)",
-
   "config_doc.language": "Message language. auto follows MCDR's current language setting (config.yml); zh_cn / en_us also work.",
   "config_doc.patterns": "The log lines to hide. A list of regexes; a line matching any of them is not shown on the MCDR console (the server's own log file is unaffected).",
   "config_doc.log_matched_lines": "When true, every hidden line is also written to the MCDR log, so you can confirm the rules really fire.",
@@ -105,7 +106,7 @@
   "config_doc.warn_about_stale_rules": "When true, a rule that matches nothing for several sessions is reported once, so dead rules can be cleaned up.",
   "config_doc.stale_rule_threshold": "How many consecutive idle sessions before the reminder. Set to 0 to disable it.",
   "config_doc.validate_patterns": "When true, patterns that would freeze the main thread (such as (a+)+$) are rejected at load time and reported in the log.",
-  "config_doc.pattern_probe_timeout_ms": "Time budget (ms) for that check. A normal rule takes about 1 us, so there is normally no reason to change it. Values below 1 are treated as 1.",
+  "config_doc.pattern_probe_timeout_ms": "Time budget (ms) for one probe string during the load-time backtracking check. It only affects loading, never the per-line cost. Values below 1 are treated as 1; values above 2000 are treated as 2000 (the ceiling keeps the probe from stalling the !!lf reload command thread). The probe is a heuristic, not a formal guarantee.",
   "config_doc.announce_config_upgrade": "When true, a plugin upgrade that fills in new config options also lists them in the console.",
   "config_doc.announce_broken_config": "When true, an unparseable config that gets backed up and reset is explained in the console, including the backup path."
 }

@@ -137,6 +137,30 @@ def _require_mcdr() -> None:
         pytest.skip("MCDR_SKIP_E2E is set")
     if not TESTLIBS.is_dir():
         pytest.skip("run tests/README.md setup first (.testlibs is missing)")
+    # Probe that a real child process can be started at all. MCDR drives the server
+    # through asyncio subprocesses, which on Windows needs named pipes; in a restricted
+    # sandbox that raises ``PermissionError`` and the whole suite fails instead of
+    # skipping -- which any automation reads as "the plugin is broken". One trivial
+    # child is enough to tell the two situations apart.
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-c", "pass"],
+            env={**os.environ, "PYTHONPATH": str(TESTLIBS)},
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        pytest.skip(
+            "cannot start a child process from this environment ({}: {}), so MCDR "
+            "cannot be driven end-to-end here".format(type(error).__name__, error)
+        )
+    if probe.returncode != 0:
+        pytest.skip(
+            "a plain child process exits with {} here, so the end-to-end suite is not "
+            "runnable: {}".format(
+                probe.returncode, probe.stderr.decode("utf-8", "replace").strip()[:200]
+            )
+        )
     probe = subprocess.run(
         [sys.executable, "-c", "import mcdreforged"],
         env={**os.environ, "PYTHONPATH": str(TESTLIBS)},
@@ -257,7 +281,7 @@ def run_mcdr(root: Path, timeout: float = 90.0, command_probe: bool = False) -> 
 
 def echoed_server_lines(output: str):
     """The lines MCDR echoed to the console from the server's stdout."""
-    return [l for l in output.splitlines() if l.startswith("[Server]")]
+    return [line for line in output.splitlines() if line.startswith("[Server]")]
 
 
 @pytest.fixture(scope="module")
@@ -276,7 +300,7 @@ def test_target_lines_are_hidden_from_the_console(e2e_output):
 
     assert echoed, "MCDR echoed no server output at all; the harness is broken"
 
-    hidden_hits = [l for l in echoed if TARGET in l]
+    hidden_hits = [line for line in echoed if TARGET in line]
     assert hidden_hits == [], "target lines were echoed to the console: {}".format(hidden_hits)
 
 
@@ -316,7 +340,7 @@ def test_hidden_line_keeps_process_flag_end_to_end(e2e_output):
     echoed = echoed_server_lines(output)
 
     # Half 1 — the canary really was filtered (otherwise the test is vacuous).
-    canary_hits = [l for l in echoed if STARTUP_LINE in l]
+    canary_hits = [line for line in echoed if STARTUP_LINE in line]
     assert canary_hits == [], (
         "the canary startup line was echoed, so the filter did not apply and this "
         "test would prove nothing: {}".format(canary_hits)
@@ -350,7 +374,7 @@ def test_mcdr_completes_the_lifecycle(e2e_output):
 def test_plugin_reports_what_it_hid(e2e_output):
     """on_server_stop must summarise the run (report_on_server_stop defaults True)."""
     output, _ = e2e_output
-    summaries = [l for l in output.splitlines() if "控制台隐去" in l and "本次运行" in l]
+    summaries = [line for line in output.splitlines() if "控制台隐去" in line and "本次运行" in line]
     assert summaries, "plugin did not log an end-of-run summary"
     # the two TARGET lines plus the canary startup line
     assert "3 行" in summaries[0], summaries[0]
@@ -425,7 +449,8 @@ def test_upgrade_is_announced_with_versions(e2e_output):
     output, _ = e2e_output
     assert "配置已更新" in output, "the upgrade was not announced"
 
-    for name, since in (
+    # 只用到 name；版本号由下面两条断言统一覆盖（`since` 不参与循环体）。
+    for name, _since in (
         ("warn_about_stale_rules", "1.1.0"),
         ("stale_rule_threshold", "1.1.0"),
         ("validate_patterns", "1.1.0"),
@@ -461,7 +486,7 @@ def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):
 def test_healthy_run_reports_no_stale_rule(e2e_output):
     """First ever run has no history, and both rules did match — nothing to warn about."""
     output, _ = e2e_output
-    assert "都没有命中" not in output
+    assert "一次都没命中过" not in output
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +539,7 @@ def test_stale_rule_warning_arrives_after_the_server_finished_starting(stale_e2e
     assert STALE_PATTERN in output, "the idle rule was never reported"
 
     done_at = output.find('Done (0.648s)! For help, type "help"')
-    warn_at = output.find("都没有命中")
+    warn_at = output.find("一次都没命中过")
     assert done_at != -1, "the fake server never printed its startup line"
     assert warn_at != -1, "no stale-rule warning was emitted"
     assert warn_at > done_at, (
@@ -527,26 +552,25 @@ def test_stale_rule_warning_arrives_after_the_server_finished_starting(stale_e2e
 
 def test_stale_rule_warning_is_specific_and_actionable(stale_e2e_output):
     output, _ = stale_e2e_output
-    assert "连续 {} 次及以上开服都没有命中".format(STALE_THRESHOLD) in output  # threshold honoured
-    assert "有 1 条过滤规则连续" in output             # count of idle rules
+    assert "连续 {} 个开服周期一次都没命中过".format(STALE_THRESHOLD) in output  # threshold honoured
+    assert "有 1 条过滤规则" in output                # count of idle rules
     assert "!!logfilter test" in output                # tells the admin how to check
     assert "!!logfilter reset" in output               # and how to silence it
     # the seeded streak (5) is longer than the threshold (2), so it IS worth stating
-    assert "（已连续 5 次零命中）" in output
+    assert "（已连续 5 个周期没命中）" in output
 
 
 def test_stale_rule_warning_does_not_repeat_itself(stale_e2e_output):
     """Nothing is said twice — the streak lives in the header, not per rule."""
     output, _ = stale_e2e_output
-    assert output.count("都没有命中") == 1, "the header must appear exactly once"
-    assert "从未命中过" not in output
+    assert output.count("一次都没命中过") == 1, "the header must appear exactly once"
 
 
 def test_only_the_idle_rule_is_flagged(stale_e2e_output):
     """A rule that did match in this run must not be dragged into the warning."""
     output, _ = stale_e2e_output
-    assert "有 1 条过滤规则连续" in output
-    warning = output[output.find("都没有命中") - 200: output.find("=====") if "=====" in output else -1]
+    assert "有 1 条过滤规则" in output
+    warning = output[output.find("一次都没命中过") - 200: output.find("=====") if "=====" in output else -1]
     assert TARGET not in warning
 
 
@@ -629,7 +653,7 @@ def test_plugin_still_works_after_a_config_reset(broken_config_e2e_output):
     output, root = broken_config_e2e_output
     assert "已启用 1 条日志过滤规则" in output, "it should fall back to the default rule"
     echoed = echoed_server_lines(output)
-    assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
+    assert [line for line in echoed if TARGET in line] == [], "filtering stopped working"
     assert (root / "startup_event_fired").is_file(), "lifecycle events broke"
 
 
@@ -692,7 +716,7 @@ def test_the_plugin_still_recovers_when_the_notice_is_off(broken_quiet_e2e_outpu
     output, root = broken_quiet_e2e_output
     assert "已启用 1 条日志过滤规则" in output, "it should fall back to the default rule"
     echoed = echoed_server_lines(output)
-    assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
+    assert [line for line in echoed if TARGET in line] == [], "filtering stopped working"
     assert (root / "startup_event_fired").is_file(), "lifecycle events broke"
 
 
@@ -889,7 +913,7 @@ def test_a_non_utf8_config_does_not_stop_the_plugin(non_utf8_config_e2e_output):
     output, root = non_utf8_config_e2e_output
     assert "Enabled 1 log filter rule(s)" in output, output[-2000:]
     echoed = echoed_server_lines(output)
-    assert [l for l in echoed if TARGET in l] == [], "filtering stopped working"
+    assert [line for line in echoed if TARGET in line] == [], "filtering stopped working"
     assert (root / "startup_event_fired").is_file(), "lifecycle events broke"
 
 
@@ -917,7 +941,7 @@ def _command_block(name, output):
     begin = output.index("E2E-CMD-BEGIN " + name)
     end = output.index("E2E-CMD-END " + name)
     lines = output[begin:end].splitlines()[1:]
-    return [stripped for stripped in (_LOG_PREFIX.sub("", l).strip() for l in lines) if stripped]
+    return [stripped for stripped in (_LOG_PREFIX.sub("", line).strip() for line in lines) if stripped]
 
 
 @pytest.fixture(scope="module")

@@ -1,0 +1,58 @@
+name: 问题反馈
+description: 插件行为不对、报错或与预期不符
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        报障时最有用的是这三样：**版本**、**日志**、**复现步骤**。缺日志的报障通常只能来回问。
+  - type: input
+    id: mcdr-version
+    attributes:
+      label: MCDR 版本
+      description: 控制台启动时打印的版本号，或 `!!MCDR version` 的输出
+      placeholder: 例如 2.16.0
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: 产物文件名里的版本，或 `!!logfilter list` 标题栏里的版本
+      placeholder: 例如 1.4.1
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望的行为与实际的行为
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好；如果与某条 `patterns` 规则有关，请把那行日志原文也贴上（可以脱敏）
+      placeholder: |
+        1. 在 config.json 里把 patterns 设为 ...
+        2. 重启服务端
+        3. 控制台出现 ...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 相关配置
+      description: "`config/server_log_filter/config.json` 里与本次报障有关的部分（注意不要把不想公开的内容贴上来）"
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: MCDR 控制台输出或 `logs/MCDR.log` 里的相关片段，包含完整 traceback（如果有）
+      render: text
+    validations:
+      required: true

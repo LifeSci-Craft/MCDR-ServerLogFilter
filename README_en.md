@@ -89,7 +89,7 @@ Running several backends? Put one copy in each; configurations are independent.
 | `warn_about_stale_rules` | `bool` | `true` | Warn once when a rule has matched nothing for several sessions (only sessions that finished starting count) |
 | `stale_rule_threshold` | `int` | `3` | How many consecutive idle sessions before warning; `0` disables this reminder |
 | `validate_patterns` | `bool` | `true` | At load, probe each rule and refuse ones with catastrophic backtracking (skipped with a warning) |
-| `pattern_probe_timeout_ms` | `int` | `25` | Time budget for that check, in milliseconds; rarely needs changing |
+| `pattern_probe_timeout_ms` | `int` | `25` | Time budget for **one probe subject** in the check above, in milliseconds. It only affects how long loading the plugin / `!!logfilter reload` takes, never the per-line cost of filtering (a normal rule is about 1 µs per line). Values below 1 are treated as 1 and above 2000 as 2000, with a warning when clamped. The check is a **heuristic**: it does not catch every pathological regex (growth ratios below the threshold, or patterns that only blow up on very long input). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) |
 | `announce_config_upgrade` | `bool` | `true` | Say which options were filled in after an upgrade |
 | `announce_broken_config` | `bool` | `true` | Say why a broken config was backed up and reset, and where the backup went |
 
