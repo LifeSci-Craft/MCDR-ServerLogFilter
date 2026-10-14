@@ -15,6 +15,7 @@
 需要 MCDR >= 2.15.0：``InfoActionFlag`` 自该版本引入；更低版本打一条错误并停用。
 """
 
+import contextvars
 import json
 import os
 import re
@@ -75,7 +76,14 @@ class Config(Serializable):
     """消息语言。``auto`` = 跟随 MCDR 当前 config.yml 里的 language 设置；也可写 zh_cn / en_us。"""
 
     patterns: List[str] = [DEFAULT_PATTERN]
-    """正则规则列表。对服务端每行日志的「正文」用 re.search 匹配，命中即从控制台隐去。"""
+    """正则规则列表。对服务端每行日志的「正文」用 re.search 匹配，命中即从控制台隐去。
+
+    这里的可变默认值是**刻意依赖 MCDR 的 Serializable 语义**：反序列化时
+    （``Config.deserialize``）每个实例都会被重新赋值，类属性不会在实例之间共享；
+    ``Config()`` 直接构造出来的实例拿到的也只是同一份列表。因此**不要**在代码里就地
+    修改 ``self.patterns``（追加 / 删除 / 排序）——那才会真的污染类属性与后续实例。
+    需要变更时先 ``list(...)`` 拷贝。同样的约定适用于 ``State.rules``。
+    """
 
     log_matched_lines: bool = False
     """调试用：把被隐去的行以 INFO 级别写进 MCDR 日志，便于确认规则是否生效。"""
@@ -93,7 +101,12 @@ class Config(Serializable):
     """载入时用短探测串检查灾难性回溯，把这类规则拦下。强烈建议保持开启。"""
 
     pattern_probe_timeout_ms: int = 25
-    """单条规则单个探测串的耗时上限（毫秒）。正常规则约 1 µs，余量超过一万倍。"""
+    """单条规则、单个探测串的耗时上限（毫秒）。
+
+    只影响**载入期**的灾难性回溯探测：真正逐行匹配时的每行开销是由规则本身决定的，
+    与这个选项无关（详见 docs/DEVELOPMENT.md「探测是启发式，不是形式化保证」）。
+    小于 1 按 1 处理；大于 ``MAX_PROBE_BUDGET_MS`` 按上限处理，且会 warning 一次。
+    """
 
     announce_config_upgrade: bool = True
     """插件升级后配置被自动补齐时，在控制台说明本次新增了哪些选项。"""
@@ -226,7 +239,21 @@ def _carry_counts(rules, previous: Dict[str, int]) -> int:
 
 
 class ServerLogFilter(InfoFilter):
-    """按规则把匹配的服务端输出从控制台隐去。"""
+    """按规则把匹配的服务端输出从控制台隐去。
+
+    计数口径（SLF-02，**这是本类的核心约定**）：**一行命中的每一条规则都计数**，
+    而不是只给第一条。原因是一次真实的错误诊断：命中路径原来是"遇到第一条匹配就
+    return 并只给它计数"，于是一行被多条重叠规则命中时，只有第一条的统计在动；
+    被它遮蔽的那条 ``count`` 永远为 0、``zero_streak`` 一路涨到阈值，插件就会建议
+    管理员**删掉一条正在正常工作、删掉后对应日志立刻重新刷屏的规则**。
+
+    （顺带说明为什么不能只改判据：被遮蔽的规则 ``count`` 确实是 0，
+    "本轮 count == 0" 区分不出"被遮蔽"与"真的没命中"。必须在计数这一层修。）
+
+    代价与补偿：最坏情况下每行要跑完全部规则（原来是找到第一条就停）。规则本身是
+    预编译的 ``re.search``，实测仍在微秒级——数字见 docs/DEVELOPMENT.md
+    「热路径的预算」，那里也记着"合并成一个正则反而更慢"的实测结论。
+    """
 
     def __init__(self, rules: List[Rule], logger, log_matched_lines: bool):
         # tuple：迭代略快，整体赋值天然原子（重载时不会看到半新半旧的规则）
@@ -247,6 +274,18 @@ class ServerLogFilter(InfoFilter):
     def total(self) -> int:
         with self._lock:
             return self._total
+
+    def counted_hits(self, rules: Optional[List[Rule]] = None) -> List[int]:
+        """持锁读出一份命中数快照，与 ``rules`` 一一对应。
+
+        状态页**不**裸读 ``rule.count``（SLF-10）：同一个类里「有的统计加锁、有的不加」
+        会让后来者无法判断哪些是刻意不加锁的。状态页不是热路径，取锁的代价可以忽略，
+        于是统一成「所有计数都经锁读」这一种口径。快照还顺手解决了「遍历期间规则被
+        ``!!lf reload`` 换掉」的显示错位（SLF-12）。
+        """
+        with self._lock:
+            target = self._rules if rules is None else tuple(rules)
+            return [rule.count for rule in target]
 
     def carry_over_from(self, previous: Optional["ServerLogFilter"]) -> int:
         """接续上一份实例的命中数（插件重载路径），否则一次开服周期会被切成两段。"""
@@ -277,10 +316,30 @@ class ServerLogFilter(InfoFilter):
             for rule in self._rules:
                 rule.count = 0
 
+    def count_matches(self, content: str) -> List[Rule]:
+        """给这一行命中的**每一条**规则计数，并按 ``self._rules`` 顺序返回它们。
+
+        逐行热路径用它。为什么不再"遇到第一条就 return"：那样只有第一条规则的统计
+        在动，被它遮蔽的规则 ``count`` 永远是 0、``zero_streak`` 一路涨到阈值，插件
+        就会建议管理员删掉一条**正在正常工作**的规则（SLF-02）。一行命中几条就记几条，
+        而"隐去"仍然只需要发生一次。
+        """
+        hit: List[Rule] = []
+        for rule in self._rules:
+            if rule.regex.search(content):
+                hit.append(rule)
+        if hit:
+            with self._lock:
+                for rule in hit:
+                    rule.count += 1
+                self._total += len(hit)
+        return hit
+
     def match(self, content: str) -> Optional[Rule]:
         """返回第一条命中的规则，没有则返回 None。
 
-        逐行热路径用它：一行只需要知道「该不该隐去」，找到第一条就可以停。
+        只回答"哪一条最先命中"（约等于"是哪条规则把它隐去的"）；需要计数请用
+        ``count_matches()``。
         """
         for rule in self._rules:
             if rule.regex.search(content):
@@ -288,12 +347,7 @@ class ServerLogFilter(InfoFilter):
         return None
 
     def matching_rules(self, content: str) -> List[Rule]:
-        """**所有**命中的规则。只给 `!!logfilter test` 用。
-
-        与 `match()` 分开是有意的：`test` 的价值在于告诉管理员「你写的规则里哪些真的生效了」，
-        只说第一条会让人以为其余几条没匹配上（于是去改本来写对的规则）。
-        热路径不受影响——那里仍然是遇到第一条就返回。
-        """
+        """**所有**命中的规则，且**不改动任何统计**。只给 `!!logfilter test` 用。"""
         return [rule for rule in self._rules if rule.regex.search(content)]
 
     def filter_server_info(self, info) -> None:
@@ -307,15 +361,10 @@ class ServerLogFilter(InfoFilter):
         if not content:
             return
 
-        rule = self.match(content)
-        if rule is None:
+        if not self.count_matches(content):
             return
 
         info.action_flag = self._hidden_flag  # 不能 return False：那等于 discarded()
-
-        with self._lock:
-            rule.count += 1
-            self._total += 1
 
         if self._log_matched_lines:
             self._logger.info(_t("rule.hidden", content=content))
@@ -325,34 +374,142 @@ class ServerLogFilter(InfoFilter):
 #  规则装载：编译 + 灾难性回溯探测
 # --------------------------------------------------------------------------
 
-# 探测串：短到最坏情况只花几百毫秒，又长到能把危险模式与正常写法拉开几个数量级。
-# （标定数据见 benchmarks/bench_filter.py 第 4 节。）
-PROBE_SUBJECTS = (
-    "a" * 22,
-    "a" * 22 + "!",
-    "0" * 22 + "!",
-    "a " * 11 + "!",
+# 探测串分三部分，执行顺序不能换。详见 docs/DEVELOPMENT.md「探测是启发式，不是形式化保证」。
+#
+# **一、增长对（多个字母表各一对，n 与 2n）。** 判据是 ``t(2n) / t(n)`` 超过
+# ``PROBE_GROWTH_RATIO`` 即指数级。它是**主**判据，而且必须在**任何**长探测串之前跑：
+#
+# * 长度必须短到对最坏的模式也能跑完。这是整层设计里最硬的一个数：φ^n 类模式每加
+#   2 个字符约 ×2.6，实测 `(a|aa)+$` 在 12 字符上 0.04 ms、20 字符上 1.8 ms、
+#   24 字符上 6 ms、28 字符上 86 ms、40 字符上 31 s、200 字符上 10^40 步。
+#   **12 与 24 是仍能给出可靠信号（比值远大于阈值）、又能把最坏耗时留在百毫秒级
+#   的翻倍档**；再往上（16/32 起）单次 `re.search` 就会跑到秒级甚至更久，而 C 层
+#   无法超时——那等于守卫自己先把 MCDR 卡住。
+# * 配对的两个串必须都是「匹配失败」的（结尾带一个不属于字符集的 `!`）：匹配成功的
+#   探测串几乎不花时间（`(a|aa)+$` 在 `"a"*12` 上 4 µs 就返回），拿它当分母等于没测。
+# * 为什么每个字母表都要一对，而不是只留 `a`：`(x+x+)+y` 这类模式在 `a` 上完全
+#   不回溯（1 µs），只在全是 `x` 的串上才爆炸。字母表覆盖不足，这一层就形同虚设。
+GROWTH_PROBE_LENGTHS = (12, 24)
+GROWTH_PROBE_ALPHABETS = ("a", "x", "0", "a ")
+GROWTH_PROBE_PAIRS = tuple(
+    tuple(fill * length + "!" for length in GROWTH_PROBE_LENGTHS)
+    for fill in GROWTH_PROBE_ALPHABETS
+)
+
+# **二、接近真实日志行长的探测串（57~91 字符）。** 真实 MC 日志行普遍 60–300 字符，
+# 只在长串上才变坏的模式在这里被绝对耗时判据拦下（长档用更小的独立预算）。这些串刻意
+# 写成**多样化的真实文本**，不是又一串 `a`：全 `a` 的长串会被 φ^n 类模式直接引爆
+# （200 个 `a` 对 `(a|aa)+$` 约 10^40 步，本身就是一次挂死），而多样文本对这类模式
+# 只是一次普通的不匹配，反而更接近它将来要跑的真实输入。
+LONG_PROBE_SUBJECTS = (
+    "Player Steve standing on air - force-sending blocks below",
+    "Player 0123456789abcdef standing on air - force-sending blocks below!",
+    "Steve lost connection: Disconnected (0.0.0.0:25565) " + "x" * 60,
+    "a " * 45 + "!",
+    "0" * 90 + "!",
+)
+
+# 三、合并视图，供需要"所有探测长度"的地方（文档、键集检查）使用。
+PROBE_SUBJECTS = tuple(
+    subject for pair in GROWTH_PROBE_PAIRS for subject in pair
+) + LONG_PROBE_SUBJECTS
+
+# 第一对增长档（n 与 2n）的长度，作为「短档 / 长档预算」的分界。
+SHORT_PROBE_LENGTH = GROWTH_PROBE_LENGTHS[0]
+
+# 长探测串的**独立**预算：长档本身更贵，用同一个 25 ms 预算会把一条只是走得慢的
+# 正常规则也判成危险，所以长档只拿短档预算的一小部分。
+LONG_PROBE_FRACTION = 0.5
+MIN_LONG_PROBE_BUDGET_MS = 1.0
+
+# 增长判据：对 n 与 2n 计时，比值超过它即视为指数级回溯。
+# 实测 `(a|aa)+$` 在 22+`!` → 44+`!` 上约 ×19（4.5 ms → 87 ms）；正常规则两组都是
+# 微秒级、低于 ``PROBE_GROWTH_FLOOR_MS`` 而直接跳过判断。比值对机器快慢不敏感，
+# 比绝对耗时更稳，是这一层的**主**判据；预算判据是兜底。
+PROBE_GROWTH_RATIO = 8.0
+# 分母低于它时比值只是噪声，不做增长判断（正常规则就落在这里）。
+PROBE_GROWTH_FLOOR_MS = 0.5
+
+# ``pattern_probe_timeout_ms`` 的下限与上限。下限 1 ms 防止「预算 ≤0 把所有规则
+# 全判危险」；上限 2000 ms 防止把它写成一个巨大的值之后，``on_load``（以及
+# ``!!lf reload`` 的命令线程）在探测上同步卡住（SLF-09）。
+#
+# 上限与探测改造是一致关系：探测总时长上界约为「各探测串的该档预算之和」，而增长
+# 判据会在危险模式上提前收工，所以把上限限在 2000 ms 时单条规则的最坏探测时长仍有界
+# （见 docs/DEVELOPMENT.md）。
+MIN_PROBE_BUDGET_MS = 1
+MAX_PROBE_BUDGET_MS = 2000
+
+# ``_probe_pattern`` 只回报「哪一类问题」，措辞交给调用方按语言拼。命名成常量，让
+# 「这些键真的有人用」对键集不变式检查（tests/test_plugin.py）可见——它们不会以字面量
+# 出现在任何 _t() 调用点上。
+PROBE_DETAIL_KEYS = ("probe.too_slow", "probe.growth")
+
+# 语言探测失败时经 ``_note()`` 记下的键。同样不会以字面量出现在任何 _t() 调用点上，
+# 列成常量是为了让键集不变式检查看得见（tests/test_plugin.py）。
+NOTE_KEYS = (
+    "language.detect_failed",
+    "language.detect_failed_summary",
+    "language.list_failed",
 )
 
 
-def _probe_pattern(regex: Pattern, budget_ms: int) -> Optional[Tuple[int, float]]:
-    """检查正则的灾难性回溯风险；正常返回 None，可疑则返回 (探测串长度, 耗时秒数)。
+def _subject_budget_ms(subject: str, budget_ms: float) -> float:
+    """按探测串长度给出这一档的预算（比增长档更长的串用更小的独立预算）。"""
+    if len(subject) > SHORT_PROBE_LENGTH:
+        return max(MIN_LONG_PROBE_BUDGET_MS, budget_ms * LONG_PROBE_FRACTION)
+    return budget_ms
 
-    只返回数字不返回句子：措辞属于语言文件的职责，由调用方拼消息。
-    为什么用短探测串就能判断，见 docs/DEVELOPMENT.md「实现注记」。
+
+def _probe_pattern(regex: Pattern, budget_ms: int) -> Optional[Tuple[str, float, int]]:
+    """检查正则的灾难性回溯风险；正常返回 None，可疑则返回 (原因键, 耗时秒数, 预算毫秒)。
+
+    三个判据，**顺序不能换**：
+
+    1. **增长率**（每个字母表的 n 与 2n）：``t(2n) / t(n)`` 超过 ``PROBE_GROWTH_RATIO``
+       即指数级。主判据，最先执行。必须先算比值、再判预算，而且探测长度必须短：
+       指数级模式在更长的串上会让**单次** ``re.search`` 跑几年，C 层无法超时，
+       只有不去测量那个长度才是安全的。
+    2. **短档绝对耗时**：任一增长档探测串超过该档预算。
+    3. **长档绝对耗时**：接近真实日志行长的探测串超过长档预算（预算更小）。
+       这是给"只在长串上才变坏"的模式准备的兜底，只有前面没发现问题时才执行。
+
+    只返回数字与原因键，不返回句子：措辞属于语言文件的职责，由调用方拼消息。
+    **这是启发式，不是形式化保证**：它拦不住所有病态正则，见 docs/DEVELOPMENT.md。
     """
-    budget = budget_ms / 1000.0
-    for subject in PROBE_SUBJECTS:
+    floor = PROBE_GROWTH_FLOOR_MS / 1000.0
+    for pair in GROWTH_PROBE_PAIRS:
+        costs: List[float] = []
+        for subject in pair:
+            budget = _subject_budget_ms(subject, budget_ms) / 1000.0
+            start = time.perf_counter()
+            regex.search(subject)
+            costs.append(time.perf_counter() - start)
+        # 比值先行：它是**机器无关**的证据，而且能在一个字母表上就把 n 与 2n 的
+        # 差距看出来。分母低于噪声底时才退回预算判据（正常规则两档都是微秒级）。
+        if costs[0] > floor and costs[-1] / costs[0] > PROBE_GROWTH_RATIO:
+            return (PROBE_DETAIL_KEYS[1], costs[-1], int(budget_ms))
+        for subject, cost in zip(pair, costs):
+            budget = _subject_budget_ms(subject, budget_ms) / 1000.0
+            if cost > budget:
+                return (PROBE_DETAIL_KEYS[0], cost, int(budget * 1000))
+
+    for subject in LONG_PROBE_SUBJECTS:
+        budget = _subject_budget_ms(subject, budget_ms) / 1000.0
         start = time.perf_counter()
         regex.search(subject)
         cost = time.perf_counter() - start
         if cost > budget:
-            return len(subject), cost
+            return (PROBE_DETAIL_KEYS[0], cost, int(budget * 1000))
     return None
 
 
 # 用来判断「这条规则是不是匹配一切」。刻意选得**差异极大**（字母/数字/标点/空白/中文），
 # 这样窄规则不可能全中；只有 `.` `.*` `^` `a?` `\w*` `.+` 这类才会全中。
+#
+# 这里**刻意不放空串**：`.` / `.+` / `\S` 这类真正的 catch-all 本来就不匹配空串
+# （Python 的 `.` 不匹配换行也不匹配空串），把 `""` 加进来会让 `all(...)` 把它们
+# 全部漏报。而只想命中空行的规则（`^$`）由 ``_hides_every_blank_line`` 单独判——见下。
 # 这类规则不会卡顿，但会让整个控制台变成一片空白——管理员会以为服务端挂了。
 CATCH_ALL_SUBJECTS = (
     "a",
@@ -373,6 +530,23 @@ def _matches_everything(regex) -> bool:
     return all(regex.search(subject) for subject in CATCH_ALL_SUBJECTS)
 
 
+def _hides_every_blank_line(regex) -> bool:
+    """这条规则是不是「命中空行」（`^$` 这类）。
+
+    与 ``_matches_everything`` 并列的第二个「会让控制台变空」的形态：它只吞掉空行，
+    影响面比 `.*` 小，但同样是管理员会漏掉的一类写法错误。
+
+    判据是**补集**而不是往探测串里加空串：``_matches_everything`` 用的是 `all()`，
+    往里加一个空串只会把 `.` / `.+` 这些真正的 catch-all 漏掉（它们不匹配空串），
+    却依然认不出 `^$`（它只匹配空串、不匹配任何非空样本）。所以这里单独判：
+    匹配空串、且一个非空样本都不匹配 —— 两个条件都满足才动手，纯字面量规则不会被误伤。
+    """
+    if regex.search("") is None:
+        return False
+    return not any(regex.search(subject) for subject in CATCH_ALL_SUBJECTS)
+
+
+
 def _build_rules(
     server: PluginServerInterface,
     patterns: List[str],
@@ -384,8 +558,21 @@ def _build_rules(
 
     # 预算 <= 0 会把**每一条**规则都判成「太慢」→ 过滤静默失效、报错还指向「回溯风险」
     # 这个错误的方向。夹到 1 ms：真实规则在微秒级、危险模式在百毫秒级，两边都分得清。
+    # 上限同理：探测在 on_load / !!lf reload 的调用线程上同步跑，写成一个巨大的值
+    # 会把这次加载卡住（SLF-09）。两个方向都只在真的钳制过时 warning 一次。
     if validate:
-        probe_budget_ms = max(1, probe_budget_ms)
+        clamped = min(MAX_PROBE_BUDGET_MS, max(MIN_PROBE_BUDGET_MS, probe_budget_ms))
+        if clamped != probe_budget_ms:
+            server.logger.warning(
+                _t(
+                    "probe.budget_clamped",
+                    given=probe_budget_ms,
+                    used=clamped,
+                    minimum=MIN_PROBE_BUDGET_MS,
+                    maximum=MAX_PROBE_BUDGET_MS,
+                )
+            )
+        probe_budget_ms = clamped
 
     rules: List[Rule] = []
     _rejected_patterns = []
@@ -418,21 +605,21 @@ def _build_rules(
         if validate:
             problem = _probe_pattern(regex, probe_budget_ms)
             if problem is not None:
+                detail_key, detail_cost, detail_budget = problem
                 server.logger.error(
                     _t(
                         "rule.dangerous",
                         pattern=pattern,
                         detail=_t(
-                            "probe.too_slow",
-                            length=problem[0],
-                            cost=problem[1] * 1000,
-                            budget=probe_budget_ms,
+                            detail_key,
+                            cost=detail_cost * 1000,
+                            budget=detail_budget,
                         ),
                     )
                 )
                 _rejected_patterns.append(pattern)
                 continue
-            if _matches_everything(regex):
+            if _matches_everything(regex) or _hides_every_blank_line(regex):
                 # 只警告、不丢弃：把管理员亲手写的规则偷偷扔掉是另一种意外，
                 # 而这条警告已经把问题说清楚了（它出现在控制台，不受本插件影响）。
                 server.logger.warning(_t("rule.catch_all", pattern=pattern))
@@ -464,6 +651,54 @@ _rejected_patterns: List[str] = []
 _warned_patterns: List[str] = []
 _duplicate_patterns: List[str] = []
 
+# 这三个列表由命令线程在 _build_rules 里**整体重新赋值**（CPython 下整体赋值是原子的，
+# 不会出现「字典在迭代中被改大小」这类崩溃）。状态页读取处必须先取局部快照
+# （``list(...)``），否则一次 !!lf reload 与 !!lf list 交错时可能显示上一版计数（SLF-12）。
+
+# 诊断信息在**本次调用的上下文**里收集，而不是挂在模块全局上：
+# 命令线程与主线程可能同时走 _resolve_language / _load_config，共享一个 dict 会互相污染，
+# 也会把上一个线程的旧诊断混进这一次的警告里（SLF-06）。值是**已经翻好**的句子，
+# 键是去重用的标识；收集时就翻译，是为了让汇总消息只做拼装、不再套一层模板。
+_notes: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
+    "server_log_filter_notes", default=None
+)
+
+
+def _note(key: str, key_name: str, **kwargs) -> None:
+    """在当前上下文的诊断表里记一条（没有上下文就丢弃，绝不抛异常）。"""
+    bucket = _notes.get()
+    if bucket is not None:
+        bucket[key_name] = _t(key, **kwargs)
+
+
+# ``_state`` 的读改写锁（SLF-08）。
+#
+# 改 ``_state`` 的路径分别跑在 MCDR 主线程（on_server_stop → _update_state_after_session）
+# 与命令线程（!!lf reload → _prune_state、!!lf reset → _reset_streaks），原来没有任何互斥，
+# 存在丢更新。这里用一把模块级锁把「读—改—写盘」整段串起来。
+#
+# 两个刻意的边界，写在这里免得以后被误当成疏漏：
+# - 延迟创建（double-checked）：插件真实重载会新建模块，模块级互斥量在重载期间可能被
+#   旧模块的线程持有着；延迟创建让新模块至少拿到一把属于自己的锁。
+# - 这把锁**管不住 MCDR 自己**的原子写：``save_config_simple`` 用固定临时名
+#   ``<name>.tmp``。本插件内部的写盘都已在这把锁里，所以不会再并发写同一个文件；
+#   但同一目录上若有别的代码在写，仍可能互踩。详见 docs/DEVELOPMENT.md
+#   「state.json 的并发窗口」。
+_state_lock_guard = threading.Lock()
+_state_lock: Optional[threading.Lock] = None
+
+
+def _state_mutex() -> threading.Lock:
+    """取 ``_state`` 的读改写锁（延迟创建，见 ``_state_lock`` 的说明）。"""
+    global _state_lock
+    lock = _state_lock
+    if lock is None:
+        with _state_lock_guard:
+            lock = _state_lock
+            if lock is None:
+                lock = _state_lock = threading.Lock()
+    return lock
+
 # 只有完成过启动的周期才计入「零命中」统计，否则连续启动失败会刷出假提醒。
 _session_reached_startup = False
 
@@ -482,14 +717,22 @@ def _t(key: str, **kwargs) -> str:
 def _mcdr_language(server: PluginServerInterface) -> Optional[str]:
     """问 MCDR 当前用的是哪种语言，供 ``language: auto`` 使用。
 
-    读不到就退回 MCDR 的配置字典，再不行返回 None。绝不抛异常。
+    读不到就退回 MCDR 的配置字典，再不行返回 None。绝不抛异常——但**失败要留下痕迹**：
+    以前这里两处 ``except Exception: pass`` 把探测性失败完全吞掉，MCDR 的 API 一变，
+    中文管理员就会突然看到英文消息而日志里一个字都没有（SLF-06）。
+    现在把失败记进 ``_note()``，由 ``_resolve_language`` 汇总成一条 warning。
     """
     getter = getattr(server, "get_mcdr_language", None)
     if callable(getter):
         try:
             language = getter()
-        except Exception:  # noqa: BLE001 - 探测性调用，失败就走下面的退路
-            pass
+        except Exception as error:  # noqa: BLE001 - 探测性调用，失败就走下面的退路
+            _note(
+                "language.detect_failed",
+                "get_mcdr_language",
+                api="get_mcdr_language",
+                error="{}: {}".format(type(error).__name__, error),
+            )
         else:
             if isinstance(language, str) and language.strip():
                 return language
@@ -498,7 +741,13 @@ def _mcdr_language(server: PluginServerInterface) -> Optional[str]:
     if callable(getter):
         try:
             config = getter()
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            _note(
+                "language.detect_failed",
+                "get_mcdr_config",
+                api="get_mcdr_config",
+                error="{}: {}".format(type(error).__name__, error),
+            )
             return None
         if isinstance(config, dict):
             language = config.get("language")
@@ -513,7 +762,17 @@ def _resolve_language(server: PluginServerInterface, setting, warn: bool = True)
     ``warn=False`` 供 _quarantine_broken_config 用：随后 _load_config 会用同一份
     原文再解析一遍，警告在那里发就够了，不必说两遍。
     """
-    choice = i18n.resolve(setting, _mcdr_language(server))
+    notes: Dict[str, str] = {}
+    token = _notes.set(notes)
+    try:
+        choice = i18n.resolve(
+            setting,
+            _mcdr_language(server),
+            notes=notes,
+        )
+    finally:
+        _notes.reset(token)
+
     if choice.note_key is not None and warn:
         server.logger.warning(
             i18n.translate(choice.note_key, choice.language, **choice.note_args)
@@ -529,7 +788,23 @@ def _resolve_language(server: PluginServerInterface, setting, warn: bool = True)
                 error=problem,
             )
         )
+    if notes and warn:
+        # 去重后合成一条：探测失败本身不致命（已经走退路），但必须可观。
+        # 诊断在**收集时**就按当时的语言翻好，这里只拼装，避免把未格式化的模板
+        # 当成参数塞进另一条模板（那样对外只会看到一串 ``{count}``）。
+        server.logger.warning(
+            i18n.translate_values(
+                "language.detect_failed_summary",
+                choice.language,
+                {
+                    "count": len(notes),
+                    "language": choice.language,
+                    "details": "; ".join(sorted(set(notes.values()))),
+                },
+            )
+        )
     return choice.language
+
 
 
 def _read_bytes(path: str) -> Optional[bytes]:
@@ -564,12 +839,16 @@ def _log_summary(server: PluginServerInterface, rules: List[Rule]) -> None:
 
 
 def _load_state(server: PluginServerInterface) -> State:
-    return server.load_config_simple(
-        file_name=STATE_FILE_NAME, target_class=State, echo_in_console=False
-    )
+    """读 state.json；损坏时先备份成 ``state.json.old`` 再交给 MCDR 重建（SLF-08）。"""
+    with _state_mutex():
+        _quarantine_broken_state(server, STATE_FILE_NAME)
+        return server.load_config_simple(
+            file_name=STATE_FILE_NAME, target_class=State, echo_in_console=False
+        )
 
 
 def _save_state(server: PluginServerInterface, state: State) -> None:
+    """写 state.json。调用方必须已经持有 ``_state_mutex()``（见 ``_state_lock``）。"""
     server.save_config_simple(state, file_name=STATE_FILE_NAME)
 
 
@@ -642,6 +921,25 @@ def _load_config(server: PluginServerInterface) -> Config:
     return config
 
 
+def _type_error_reason(parsed, say) -> Optional[str]:
+    """原文能解析成对象，但 ``Config.deserialize`` 吃不下它 —— 返回原因文案或 None。
+
+    **类型写坏**（合法 JSON、字段类型不符，例如 ``"stale_rule_threshold": "three"``）
+    只有到 ``Config.deserialize`` 才会暴露，而 MCDR 默认 ``failure_policy='regen'``
+    会直接用默认值覆盖原文件：用户写的 patterns 静默消失、不留 ``.old``、也没有那条
+    解释性提示（SLF-04）。这里先自己无副作用地试一次反序列化
+    （MCDR 的 Serializable 从不变更传入的 dict）。
+
+    与另外三种「写坏」共用 ``_quarantine_broken_config`` 的**同一次**备份与播报，
+    所以本函数只算原因，不碰文件。
+    """
+    try:
+        Config.deserialize(parsed)
+    except Exception as error:  # noqa: BLE001 - 类型/取值任何不符都走同一条路
+        return say("broken.bad_types", error="{}: {}".format(type(error).__name__, error))
+    return None
+
+
 def _raw_bool_option(raw: str, name: str) -> Optional[bool]:
     """从可能并不合法的配置原文里尽力读出一个布尔选项。
 
@@ -659,9 +957,13 @@ def _raw_bool_option(raw: str, name: str) -> Optional[bool]:
 
 
 def _raw_str_option(raw: str, name: str) -> Optional[str]:
-    """同 ``_raw_bool_option``，但读字符串选项（目前只有 ``language``）。"""
+    """同 ``_raw_bool_option``，但读字符串选项（目前只有 ``language``）。
+
+    同时接受单引号：严格 JSON 里字符串只能是双引号，但这段原文**本来就是写坏的文件**，
+    手写/工具生成时混进单引号很常见；只认双引号会让抄回来的 language 悄悄失效（SLF-14）。
+    """
     match = re.search(
-        r'"{}"\s*:\s*"([^"]*)"'.format(re.escape(name)),
+        r"""['"]{}['"]\s*:\s*['"]([^'"]*)['"]""".format(re.escape(name)),
         raw,
     )
     if match is None:
@@ -670,16 +972,18 @@ def _raw_str_option(raw: str, name: str) -> Optional[str]:
     return value or None
 
 
+
 def _quarantine_broken_config(
     server: PluginServerInterface, file_name: str, data: Optional[bytes] = None
 ) -> Optional[str]:
     """配置解析失败时先把它挪到 ``<name>.old``，并把解析错误说明返回给上层。
 
     必须在交给 MCDR 之前自己看一遍：``load_config_simple`` 默认 ``failure_policy
-    ='regen'``，会直接用默认值覆盖原文件，用户写的规则就此消失。三种「写坏」都在
-    这里拦下——JSON 语法错误、顶层不是对象、以及**不是合法的 UTF-8**（后者同样会让
-    MCDR 解析失败，所以也得先备份）。备份永远执行，``announce_broken_config`` 只管
-    说不说；开关与语言只能从原文里读（此刻没有解析好的配置）。
+    ='regen'``，会直接用默认值覆盖原文件，用户写的规则就此消失。**四种「写坏」**都在
+    这里拦下——JSON 语法错误、顶层不是对象、**字段类型不符**（合法 JSON 但
+    ``Config.deserialize`` 吃不下，SLF-04）、以及**不是合法的 UTF-8**。备份永远执行，
+    ``announce_broken_config`` 只管说不说；开关与语言只能从原文里读（此刻没有解析好的
+    配置）。
     """
     path = os.path.join(server.get_data_folder(), file_name)
     if not os.path.isfile(path):
@@ -710,9 +1014,12 @@ def _quarantine_broken_config(
         except ValueError as error:
             reason = say("broken.json_error", error=error)
         else:
-            if isinstance(parsed, dict):
-                return None
-            reason = say("broken.not_an_object", kind=type(parsed).__name__)
+            if not isinstance(parsed, dict):
+                reason = say("broken.not_an_object", kind=type(parsed).__name__)
+            else:
+                reason = _type_error_reason(parsed, say)
+                if reason is None:
+                    return None          # 四种「写坏」都不成立，交给 MCDR
 
     backup = path + CONFIG_BACKUP_SUFFIX
     try:
@@ -727,6 +1034,12 @@ def _quarantine_broken_config(
     if _raw_bool_option(raw or "", BROKEN_CONFIG_NOTICE_OPTION) is False:
         return reason  # 灯关了：备份照做，只是不再播报
 
+    _announce_broken_config(server, say, file_name, reason)
+    return reason
+
+
+def _announce_broken_config(server, say, file_name: str, reason: str) -> None:
+    """配置「写坏 / 读不动」被备份后的那条解释性提示（两种检疫共用）。"""
     shown_path = "{}/{}".format(_CONFIG_FOLDER_DISPLAY, file_name)
     server.logger.error(
         "\n".join(
@@ -745,6 +1058,62 @@ def _quarantine_broken_config(
                 "",
             ]
         )
+    )
+
+
+def _quarantine_broken_state(
+    server: PluginServerInterface, state_file: str
+) -> Optional[str]:
+    """``state.json`` 的检疫：写了但读不出来（语法 / 类型 / 编码坏）时备份 + 播报。
+
+    以前只有 ``config.json`` 有这层保护，state.json 一旦损坏就走 MCDR 的 REGEN 静默重置，
+    命中历史与连续零命中计数无声消失、不留 ``.old``（SLF-08）。这里把它补上，并复用与
+    配置完全相同的一套 `.old` 约定；文案用同一个 ``broken.*`` 段落，因为管理员要的信息
+    是一样的（哪个文件、备份在哪、为什么）。返回原因文案，没问题则返回 None。
+    """
+    path = os.path.join(server.get_data_folder(), state_file)
+    if not os.path.isfile(path):
+        return None
+    data = _read_bytes(path)
+    if data is None:
+        return None
+
+    raw = _decode_utf8(data)
+    if raw is None:
+        reason = _t("broken.not_utf8")
+    else:
+        try:
+            parsed = json.loads(raw)
+        except ValueError as error:
+            reason = _t("broken.json_error", error=error)
+        else:
+            if not isinstance(parsed, dict):
+                reason = _t("broken.not_an_object", kind=type(parsed).__name__)
+            else:
+                try:
+                    State.deserialize(parsed)
+                except Exception as error:  # noqa: BLE001 - 同 _quarantine_unloadable_config
+                    reason = _t(
+                        "broken.bad_types",
+                        error="{}: {}".format(type(error).__name__, error),
+                    )
+                else:
+                    return None
+
+    backup = path + CONFIG_BACKUP_SUFFIX
+    try:
+        os.replace(path, backup)
+    except OSError as error:
+        server.logger.error(
+            _t("broken.backup_failed", file=state_file, error=error)
+        )
+        return reason
+
+    # state.json 里没有开关（它是插件自己写的文件），所以只有一条 warning。
+    server.logger.warning(
+        _t("state.broken_backup", file=state_file, backup=state_file + CONFIG_BACKUP_SUFFIX)
+        + "\n"
+        + _t("broken.reason_line", reason=reason)
     )
     return reason
 
@@ -784,10 +1153,12 @@ def _prune_state(
 
     只在真清掉了东西时才写盘。必须在重载时做，不能等服务端停止：后者要一个完整
     开服周期才跑，管理员删完规则去看 state.json 会看到已经没用的旧统计。
+    与 ``_update_state_after_session`` 共用同一把 ``_state_mutex()``（SLF-08）。
     """
-    removed = _forget_orphans(state, patterns)
-    if removed:
-        _save_state(server, state)
+    with _state_mutex():
+        removed = _forget_orphans(state, patterns)
+        if removed:
+            _save_state(server, state)
     return removed
 
 
@@ -803,36 +1174,51 @@ def _announce_pruned(server: PluginServerInterface, removed: List[str]) -> None:
 def _update_state_after_session(
     server: PluginServerInterface, state: State, rules: List[Rule], patterns: List[str]
 ) -> None:
-    """一次开服周期结束时，把命中数写进历史并推进「连续零命中」计数。"""
-    state.session_index += 1
-    session_index = state.session_index
+    """一次开服周期结束时，把命中数写进历史并推进「连续零命中」计数。
 
-    for rule in rules:
-        entry = state.rules.get(rule.pattern)
-        if entry is None:
-            entry = RuleState()
-            state.rules[rule.pattern] = entry
-        entry.hits_last_session = rule.count
-        entry.total_hits += rule.count
-        if rule.count > 0:
-            entry.zero_streak = 0
-            entry.last_hit_session = session_index
-        else:
-            entry.zero_streak += 1
+    整个「读—改—写盘」在 ``_state_mutex()`` 里：本函数跑在 MCDR 主线程，而
+    ``!!lf reload``（``_prune_state``）与 ``!!lf reset``（``_reset_streaks``）跑在
+    命令线程，没有互斥就会丢更新（SLF-08）。
+    """
+    with _state_mutex():
+        state.session_index += 1
+        session_index = state.session_index
 
-    _forget_orphans(state, patterns)  # 顺手清掉已删除的规则，避免文件无限增长
+        for rule in rules:
+            entry = state.rules.get(rule.pattern)
+            if entry is None:
+                entry = RuleState()
+                state.rules[rule.pattern] = entry
+            entry.hits_last_session = rule.count
+            entry.total_hits += rule.count
+            if rule.count > 0:
+                entry.zero_streak = 0
+                entry.last_hit_session = session_index
+            else:
+                entry.zero_streak += 1
 
-    _save_state(server, state)
+        _forget_orphans(state, patterns)  # 顺手清掉已删除的规则，避免文件无限增长
+
+        _save_state(server, state)
 
 
 def _collect_stale(
     state: State, rules: List[Rule], threshold: int
 ) -> List[Tuple[str, RuleState]]:
-    """找出连续零命中已达阈值的规则（只关心当前配置里还在的）。"""
+    """找回本轮**一次都没命中**、且零命中年数已达阈值的规则。
+
+    「本轮 count == 0」这一条判据不能少（SLF-02 / SLF-05）。命中路径遇到第一条
+    匹配就 return，所以一行命中多条重叠规则时只有第一条被计数；这会让**正在正常
+    工作的**规则长期 count == 0、zero_streak 一路涨到阈值，于是插件建议管理员把它
+    删掉——而删掉后对应日志立刻重新刷屏。加上「本轮真的零命中」之后，这类被遮蔽的
+    规则不会再被报成「从未命中」。它同时挡住了 SLF-05 那个假提醒：管理员把写错的
+    规则改对之后，若中间有一个周期没走到 startup（崩溃 / 手动 kill），残留的
+    zero_streak 会停在阈值上；下一轮它已经命中过（count > 0），于是不再重复告警。
+    """
     stale: List[Tuple[str, RuleState]] = []
     for rule in rules:
         entry = state.rules.get(rule.pattern)
-        if entry is not None and entry.zero_streak >= threshold:
+        if entry is not None and entry.zero_streak >= threshold and rule.count == 0:
             stale.append((rule.pattern, entry))
     return stale
 
@@ -885,6 +1271,15 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
 
     if InfoActionFlag is None:
         # 还没有配置可读，语言只能问 MCDR 自己；然后放弃注册，避免每行都抛异常。
+        #
+        # 必须**显式**把三个状态变量置回 None：真实重载会构造新模块（本来就是 None），
+        # 但模块级全局在进程内是复用的，跨版本降级 / 二次 on_load 时它们可能还指着旧的
+        # 对象。若不清，on_server_startup 一进来就会 None.warn_about_stale_rules 或
+        # 拿旧过滤器算统计（SLF-03）。
+        _config = None
+        _log_filter = None
+        _state = None
+        _session_reached_startup = False
         _language_setting = i18n.AUTO
         _language = i18n.resolve(i18n.AUTO, _mcdr_language(server)).language
         server.logger.error(_t("plugin.requires_mcdr", version=MIN_MCDR_VERSION))
@@ -948,7 +1343,10 @@ def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str],
     carried = 0
     if _log_filter is not None:
         carried = _log_filter.reload_rules(rules, _config.log_matched_lines)
-    pruned = [] if _state is None else _prune_state(server, _state, _config.patterns)
+    # 拿一份 patterns 的局部副本再交给清理：`_config` 是模块级对象，命令线程下一次
+    # 重载会整体替换它（SLF-12）。
+    configured = list(_config.patterns)
+    pruned = [] if _state is None else _prune_state(server, _state, configured)
     return rules, pruned, carried
 
 
@@ -968,15 +1366,24 @@ def on_server_startup(server: PluginServerInterface) -> None:
     global _session_reached_startup
     _session_reached_startup = True
 
+    # 判空必须与 on_server_stop 形状一致，``_config`` 必须在最前面（SLF-03）：
+    # 低版本 MCDR 上 on_load 打完「请升级」就 return，_config 仍是 None，而 MCDR
+    # 照常派发生命周期事件——原来这里第一句就是 None.warn_about_stale_rules，
+    # 每次开服完成都抛一条 AttributeError。
     if (
-        not _config.warn_about_stale_rules
+        _config is None
+        or not _config.warn_about_stale_rules
         or _state is None
         or _log_filter is None
         or _config.stale_rule_threshold <= 0
     ):
         return
 
-    stale = _collect_stale(_state, list(_log_filter.rules), _config.stale_rule_threshold)
+    # 持 _state 锁读一份规则计数快照：_collect_stale 的判据里有 rule.count（SLF-02），
+    # 而计数由主线程写，读的时候要和其他统计路径一个口径（SLF-10）。
+    rules = list(_log_filter.rules)
+    with _state_mutex():
+        stale = _collect_stale(_state, rules, _config.stale_rule_threshold)
     if stale:
         _emit_stale_warning(server, stale, _config.stale_rule_threshold)
 
@@ -984,14 +1391,14 @@ def on_server_startup(server: PluginServerInterface) -> None:
 def on_server_stop(server: PluginServerInterface, server_return_code: int) -> None:
     global _session_reached_startup
 
-    if _log_filter is None or _config is None:
+    if _log_filter is None or _config is None or _state is None:
         return
 
-    if _session_reached_startup and _state is not None:
+    if _session_reached_startup:
         try:
-            _update_state_after_session(
-                server, _state, list(_log_filter.rules), _config.patterns
-            )
+            # 规则与计数在各线程里写，所以先取一份快照再交给状态更新（SLF-08/SLF-10）。
+            rules = list(_log_filter.rules)
+            _update_state_after_session(server, _state, rules, _config.patterns)
         except Exception:  # noqa: BLE001 - 状态写盘失败不应影响服务端收尾
             server.logger.exception(_t("state.save_failed"))
     _session_reached_startup = False
@@ -1142,7 +1549,15 @@ def _show_status(source) -> None:
         source.reply(RText(_t("cmd.not_initialised"), RColor.red))
         return
 
-    rules = _log_filter.rules
+    # 一切都在**局部快照**上操作：规则元组与三个模块级列表都会被命令线程的
+    # `!!lf reload` 整体替换，直接边遍历边读会让一次 list/reload 交错显示上一版计数
+    # （SLF-12）。命中数则统一经 `counted_hits()` 持锁读（SLF-10）。
+    rules = tuple(_log_filter.rules)
+    counts = _log_filter.counted_hits(list(rules))
+    warned = list(_warned_patterns)
+    rejected = list(_rejected_patterns)
+    duplicate = list(_duplicate_patterns)
+
     if i18n.normalize(_language_setting) in ("", i18n.AUTO):
         language_line = _t("status.language_auto", code=_language)
     else:
@@ -1172,7 +1587,7 @@ def _show_status(source) -> None:
                 RColor.gray,
             )
         )
-        parts.append(RText(_t("status.rule_hits", count=rule.count), RColor.green))
+        parts.append(RText(_t("status.rule_hits", count=counts[index - 1]), RColor.green))
         parts.append(RText("-- ", RColor.gray))
         parts.append(RText(rule.pattern, RColor.white))
         entry = _state.rules.get(rule.pattern) if _state is not None else None
@@ -1193,32 +1608,32 @@ def _show_status(source) -> None:
                     RText(_t("status.streak", streak=entry.zero_streak), RColor.gray)
                 )
 
-    if _warned_patterns:
+    if warned:
         parts.append("\n")
         parts.append(
             _field(
                 _t("status.warned_label"),
-                _t("status.warned", count=len(_warned_patterns)),
+                _t("status.warned", count=len(warned)),
                 RColor.red,
             )
         )
 
-    if _rejected_patterns:
+    if rejected:
         parts.append("\n")
         parts.append(
             _field(
                 _t("status.rejected_label"),
-                _t("status.rejected", count=len(_rejected_patterns)),
+                _t("status.rejected", count=len(rejected)),
                 RColor.yellow,
             )
         )
 
-    if _duplicate_patterns:
+    if duplicate:
         parts.append("\n")
         parts.append(
             _field(
                 _t("status.duplicate_label"),
-                _t("status.duplicate", count=len(_duplicate_patterns)),
+                _t("status.duplicate", count=len(duplicate)),
                 RColor.yellow,
             )
         )
@@ -1234,6 +1649,10 @@ def _show_status(source) -> None:
         )
 
     parts.append("\n")
+    # 「各规则命中数之和」不一定等于「本次已隐去」：一行可能被多条重叠规则命中，
+    # 而只需要隐去一次。不说明的话管理员会以为统计坏了（SLF-13）。
+    parts.append(RText(_t("status.counting_note"), RColor.gray))
+    parts.append("\n")
     parts.append(RText(_t("status.tip_label"), RColor.aqua))
     parts.append(RText(_t("status.tip"), RColor.gray))
     source.reply(parts)
@@ -1244,9 +1663,20 @@ def _reload(source) -> None:
     if _server is None:
         source.reply(RText(_t("cmd.not_initialised_reload"), RColor.red))
         return
-    rules, pruned, carried = _apply_config(_server)
-    _log_summary(_server, rules)
-    _announce_pruned(_server, pruned)
+    # 重载路径会读配置、编译正则、写 state，任一步都可能抛（配置文件权限、正则爆炸、
+    # 磁盘满）。`!!lf reset` 早就兜了异常，命令面两种待遇说不过去：MCDR 只会记一条
+    # traceback，管理员得不到任何回复（SLF-15）。
+    try:
+        rules, pruned, carried = _apply_config(_server)
+        _log_summary(_server, rules)
+        _announce_pruned(_server, pruned)
+    except Exception as error:  # noqa: BLE001 - 命令面必须给出可读回复
+        # 详情拼进消息本身，而不是只靠 logger.exception 的 traceback：管理员在控制台
+        # 也常常只看到命令回复那一行，异常类型与原因必须跟着它一起出现。
+        detail = "{}: {}".format(type(error).__name__, error)
+        _server.logger.exception(_t("reload.failed", error=detail))
+        source.reply(RText(_t("reload.failed_reply", error=detail), RColor.red))
+        return
     reply = RTextList(
         RText(_t("reload.done"), RColor.green),
         RText(_t("reload.count", count=len(rules)), RColor.gray),
@@ -1265,13 +1695,16 @@ def _reset_streaks(source) -> None:
         source.reply(RText(_t("cmd.not_initialised_reset"), RColor.red))
         return
     cleared = 0
-    for rule in _log_filter.rules:
-        entry = _state.rules.get(rule.pattern)
-        if entry is not None and entry.zero_streak:
-            entry.zero_streak = 0
-            cleared += 1
     try:
-        _save_state(_server, _state)
+        # 与 on_server_stop / _prune_state 共用同一把锁，别让命令线程的读改写
+        # 和主线程的结算互相覆盖（SLF-08）。
+        with _state_mutex():
+            for rule in _log_filter.rules:
+                entry = _state.rules.get(rule.pattern)
+                if entry is not None and entry.zero_streak:
+                    entry.zero_streak = 0
+                    cleared += 1
+            _save_state(_server, _state)
     except Exception:  # noqa: BLE001
         _server.logger.exception(_t("state.reset_save_failed"))
     source.reply(
@@ -1294,7 +1727,15 @@ def _test_line(source, context) -> None:
         return
 
     text = context["text"]
-    body = _LOG_LINE_PREFIX.sub("", text, count=1) or text
+    # 显式判断，不用 ``_LOG_LINE_PREFIX.sub(...) or text``（SLF-15）：管理员若只粘贴了
+    # 前缀本身（``[12:00:00] [Server thread/INFO]: ``），剥完是**空串**——空串在布尔
+    # 上下文里是假值，``or`` 会退回带前缀的原文，于是 ``^`` 锚定的规则被报成「不命中」，
+    # 而真实过滤时该行确实会被剥掉前缀后匹配，结论正好相反。
+    # 所以：认得出前缀就一律用剥掉后的正文（哪怕它是空串），认不出才用原文。
+    if _LOG_LINE_PREFIX.match(text):
+        body = _LOG_LINE_PREFIX.sub("", text, count=1)
+    else:
+        body = text
     matched = _log_filter.matching_rules(body)
 
     if not matched:

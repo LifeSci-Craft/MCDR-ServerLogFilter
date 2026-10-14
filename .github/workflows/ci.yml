@@ -5,21 +5,55 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here needs to write to the repository, and the unit job executes whatever the tree
+# contains — so the token is narrowed rather than left at the repository default.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run pointless; the mutation job rewrites
+# source files, so leaving two of them alive at once is worse than useless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ruff
+        run: python -m pip install "ruff==0.17.0"
+      - name: Lint
+        run: ruff check .
+
   unit:
     name: unit tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # Both READMEs declare Python >= 3.9, so 3.9 is a leg rather than a claim. The pinned
+      # pytest (9.1.1) itself needs >= 3.10, so that one leg installs the newest pytest that
+      # still supports 3.9; every other job uses tests/requirements-test.txt.
       - name: Install test dependencies
-        run: python -m pip install --target .testlibs -r tests/requirements-test.txt
+        run: |
+          if [ "${{ matrix.python-version }}" = "3.9" ]; then
+            python -m pip install --target .testlibs "mcdreforged==2.16.0" "pytest==8.3.5"
+          else
+            python -m pip install --target .testlibs -r tests/requirements-test.txt
+          fi
       - name: Run the suite (real-MCDR end-to-end excluded here)
         env:
           MCDR_SKIP_E2E: "1"
@@ -28,6 +62,9 @@ jobs:
   mutation:
     name: mutation check
     runs-on: ubuntu-latest
+    # This job rewrites source files and restores them. Without a timeout a hang sits on the
+    # default six hours with an injected tree.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,6 +79,7 @@ jobs:
   e2e:
     name: end-to-end (real MCDR)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -58,3 +96,48 @@ jobs:
           name: e2e-logs
           path: /tmp/pytest-of-*/**
           if-no-files-found: ignore
+
+  mcdr-matrix:
+    # The headline claim is "requires MCDR 2.15.0 or newer; tested on 2.15.0 / 2.15.7 / 2.16.0".
+    # One job per version, each booting a real MCDR with a fake server, so the claim is checked
+    # rather than remembered. `pip install --target` is what makes this affordable: no three
+    # pre-built interpreters, one install per job.
+    name: real MCDR ${{ matrix.mcdr }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mcdr: ["2.15.0", "2.15.7", "2.16.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install MCDR ${{ matrix.mcdr }} and pytest
+        run: python -m pip install --target .testlibs "mcdreforged==${{ matrix.mcdr }}" pytest
+      - name: Load the packed plugin and drive the whole flow
+        run: PYTHONPATH=.testlibs python tools/mcdr_matrix.py --current
+      - name: Upload the MCDR console when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcdr-${{ matrix.mcdr }}-console
+          path: /tmp/slf_matrix_work_*/**
+          if-no-files-found: ignore
+
+  artifact:
+    # `.mcdr` is built from the tag and attached to a release, so "rebuild it from the source
+    # and compare the hash" has to actually work. The packer pins zip timestamps, permissions
+    # and line endings for exactly that reason; this job is what keeps it true, including the
+    # CRLF case that a Windows working tree produces.
+    name: the artifact is reproducible and loadable
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Pack twice, compare, and inspect
+        run: python tools/check_artifact.py

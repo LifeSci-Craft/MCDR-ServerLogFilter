@@ -1,11 +1,12 @@
 {
   "plugin.requires_mcdr": "Server Log Filter 需要 MCDR >= {version}，当前版本不支持 InfoActionFlag，插件已停用。请升级 MCDR 后重试。",
   "language.unsupported": "配置里的 language 值 {value} 无法识别，已改用 {fallback}。可选值：{options}。",
+  "language.detect_failed": "询问 MCDR 语言时 {api} 抛了异常（{error}）",
+  "language.list_failed": "{api} 读取语言目录也失败了（{error}）",
+  "language.detect_failed_summary": "[ServerLogFilter] 无法从 MCDR 问到当前语言（{count} 项失败），language: auto 已退回 {language}：{details}。相关 MCDR API 可能已改名或被禁用，可改用显式的 language 设置。",
   "catalog.unreadable": "[ServerLogFilter] 语言文件 {path} 读取失败（{error}），相关消息会直接显示键名。",
-
   "summary.rules_enabled": "已启用 {count} 条日志过滤规则；命中后仅从 MCDR 控制台隐去，服务端日志不受影响",
   "summary.no_rules": "未启用任何过滤规则（patterns 为空或全部编译失败）",
-
   "rule.catch_all": "过滤规则匹配一切，已保留但请检查: {pattern!r} —— 这条规则会隐去**所有**服务端输出，控制台看起来就像服务端没在运行。常见的写法错误是 `.`、`.*`、`^`、`?`、`\\w*` 这类。",
   "rule.duplicate": "过滤规则重复，只保留第一条: {pattern!r}",
   "status.warned_label": "匹配一切: ",
@@ -15,28 +16,30 @@
   "rule.hidden": "[ServerLogFilter] 已隐去: {content}",
   "rule.compile_failed": "过滤规则编译失败，已跳过: {pattern!r} ({error})",
   "rule.dangerous": "过滤规则存在灾难性回溯风险，已跳过: {pattern!r} —— {detail}。这条规则几乎每行都会让 MCDR 主线程卡顿，请改写成普通子串或去掉嵌套量词后重试。",
-  "probe.too_slow": "在 {length} 字符的探测串上已耗时 {cost:.0f} ms（上限 {budget} ms）",
-
+  "probe.too_slow": "在探测中已耗时 {cost:.0f} ms（该档上限 {budget} ms）",
+  "probe.growth": "探测耗时随输入长度快速增长（{cost:.0f} ms，已超过增长判据对应的 {budget} ms 预算档），呈指数级回溯特征",
+  "probe.budget_clamped": "[ServerLogFilter] 配置项 pattern_probe_timeout_ms 写的是 {given}，已按 [{minimum}, {maximum}] 钳制为 {used}。这个值只影响载入期的探测耗时，不改变逐行匹配的开销。",
   "reload.carried": "已从重载前的实例接续 {count} 条命中计数",
   "reload.carried_session": "；本轮已命中的 {count} 次继续保留",
+  "reload.failed": "[ServerLogFilter] !!logfilter reload 执行失败：{error}",
+  "reload.failed_reply": "重载失败，规则保持原样，详见 MCDR 日志：{error}",
   "session.report": "本次运行共从 MCDR 控制台隐去 {total} 行服务端日志（服务端日志文件不受影响）",
   "help.logfilter": "服务端日志过滤器（!!lf）：查看状态 / 测试规则 / 重载规则",
-
   "state.save_failed": "写入日志过滤统计（state.json）失败",
   "state.reset_save_failed": "写入 state.json 失败",
+  "state.broken_backup": "[ServerLogFilter] state.json 读不出来，已备份为 {backup} 并用空统计继续。命中历史与连续零命中计数会从零重新累计。",
   "state.pruned_header": "[ServerLogFilter] 已从 state.json 清除 {count} 条规则统计（它们已不在配置的 patterns 中）",
   "state.pruned_entry": "  · {pattern}",
-
   "upgrade.title": "[ServerLogFilter] 配置已更新：本次新增了 {count} 个配置项，已按默认值写入",
   "upgrade.entry": "  · {name}  （v{since} 加入）",
   "upgrade.entry_desc": "      {desc}",
   "upgrade.config_path": "  配置文件：{folder}/config.json",
   "upgrade.readme_hint": "  各项含义见 README 的「配置」一节。",
   "upgrade.no_description": "（未记录说明）",
-
   "broken.json_error": "JSON 语法错误：{error}",
   "broken.not_an_object": "顶层应为 JSON 对象，实际是 {kind}",
   "broken.not_utf8": "文件不是合法的 UTF-8 文本（常见原因：在 Windows 上用记事本以 ANSI/GBK 编码保存）",
+  "broken.bad_types": "JSON 语法没问题，但字段类型对不上：{error}",
   "broken.backup_failed": "[ServerLogFilter] 配置文件无法解析，但备份到 {file}.old 也失败了（{error}）。原文件可能已被重置，请注意保存。",
   "broken.title": "[ServerLogFilter] 配置文件无法解析，已重置为默认配置",
   "broken.file_line": "  · 出问题的文件：{path}",
@@ -46,9 +49,8 @@
   "broken.reload_hint": "    或用 !!logfilter reload 在修好后立即重新加载。",
   "broken.cause_comma": "  常见原因：数组（patterns）里每个元素之间都要有英文逗号 \",\"，",
   "broken.cause_trailing": "            且最后一项后面不要留多余的逗号。",
-
-  "stale.title": "[ServerLogFilter] 注意：有 {count} 条过滤规则连续 {threshold} 次及以上开服都没有命中",
-  "stale.entry_extra": "   （已连续 {streak} 次零命中）",
+  "stale.title": "[ServerLogFilter] 注意：有 {count} 条过滤规则已经连续 {threshold} 个开服周期一次都没命中过",
+  "stale.entry_extra": "   （已连续 {streak} 个周期没命中）",
   "stale.cause_header": "  这些规则通常只有两种可能：",
   "stale.cause_regex": "    1. 正则写错了（拼写 / 大小写 / 转义，或与当前服务端版本不匹配）",
   "stale.cause_gone": "    2. 它要过滤的日志已经不再产生（例如上游 bug 已被修复）",
@@ -57,7 +59,6 @@
   "stale.advice_threshold": "        若确认只是「本来就罕见」可调大 stale_rule_threshold，",
   "stale.advice_reset": "        或用 !!logfilter reset 清空计数重新观察。",
   "stale.note": "  （提醒本身不影响性能，只是为了保持配置干净。）",
-
   "cmd.not_initialised": "日志过滤器尚未初始化",
   "cmd.not_initialised_reload": "插件尚未初始化，无法重载",
   "cmd.not_initialised_reset": "插件尚未初始化，无法重置",
@@ -77,6 +78,7 @@
   "status.sessions": "{count} 个",
   "status.rejected_label": "已跳过: ",
   "status.rejected": "{count} 条规则（正则写错或回溯风险，原因见 MCDR 日志）",
+  "status.counting_note": "说明: 一行日志可能被多条规则同时命中，而只需要隐去一次；所以「本次已隐去」可能小于各规则命中数之和。",
   "status.tip_label": "提示: ",
   "status.tip": "服务端自身日志不受影响；被隐去的行仍会正常派发给插件事件。",
   "help.usage": "用法: {command} <子命令>（{alias} 亦可）",
@@ -97,7 +99,6 @@
   "test.miss": "不会被隐去",
   "test.miss_detail": "    该行不匹配任何规则",
   "test.stripped_note": "（已剥掉 [时间] [线程/级别]: 前缀，按真正参与匹配的正文测试）",
-
   "config_doc.language": "消息语言。auto = 跟随 MCDR 当前 config.yml 里的 language 设置；也可写 zh_cn / en_us。",
   "config_doc.patterns": "要隐去的日志。正则列表，一行命中任意一条就不在 MCDR 控制台显示（服务端自身日志文件不受影响）。",
   "config_doc.log_matched_lines": "true 时把每条被隐去的行也写进 MCDR 日志，用来确认规则真的生效。",
@@ -105,7 +106,7 @@
   "config_doc.warn_about_stale_rules": "true 时，某条规则连续多个开服周期零命中会提醒一次，便于清理失效规则。",
   "config_doc.stale_rule_threshold": "连续多少个开服周期零命中才提醒。设成 0 可关闭该提醒。",
   "config_doc.validate_patterns": "true 时在载入时拦下会拖死主线程的危险正则（如 (a+)+$）并在日志报错。",
-  "config_doc.pattern_probe_timeout_ms": "上面那项检查的耗时上限（毫秒）。正常规则约 1 µs，一般无需改动。小于 1 会按 1 处理。",
+  "config_doc.pattern_probe_timeout_ms": "载入期回溯探测里、单个探测串的耗时上限（毫秒）。只影响载入耗时，与逐行匹配开销无关。小于 1 按 1 处理，大于 2000 按 2000 处理（上限是为了不让探测把 !!lf reload 的命令线程卡住）。探测是启发式，不能保证拦下所有病态正则。",
   "config_doc.announce_config_upgrade": "true 时，插件更新后若配置被自动补齐，会在控制台列出本次新增的选项。",
   "config_doc.announce_broken_config": "true 时，配置文件解析失败被备份并重置时，会在控制台说明原因与备份路径。"
 }

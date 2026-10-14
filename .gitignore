@@ -5,8 +5,18 @@ __pycache__/
 .venv/
 venv/
 
+# 本地缓存（pytest 在受限目录下建不出来时会在仓库根留下 pytest-cache-files-*）
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+pytest-cache-files-*/
+
 # 测试依赖（见 tests/README.md）
 .testlibs/
+
+# 本地配置与私密文件
+.env
+config/
 
 # 构建产物（.mcdr 请通过 Releases 分发）
 *.mcdr

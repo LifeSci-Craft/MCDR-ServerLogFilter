@@ -1,6 +1,6 @@
 {
   "id": "server_log_filter",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "name": "Server Log Filter",
   "description": {
     "en_us": "Hide noisy server console lines from the MCDR console with configurable regex rules, without touching the server's own log file.",

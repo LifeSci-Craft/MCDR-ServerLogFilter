@@ -13,8 +13,10 @@ Run from the repository root::
 Needs the ``.testlibs`` setup (see tests/README.md).
 """
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,14 +30,19 @@ LANG_ZH = "server_log_filter/lang/zh_cn.json"
 PACK = "pack.py"
 
 WARN_BLOCK = """    if (
-        not _config.warn_about_stale_rules
+        _config is None
+        or not _config.warn_about_stale_rules
         or _state is None
         or _log_filter is None
         or _config.stale_rule_threshold <= 0
     ):
         return
 
-    stale = _collect_stale(_state, list(_log_filter.rules), _config.stale_rule_threshold)
+    # 持 _state 锁读一份规则计数快照：_collect_stale 的判据里有 rule.count（SLF-02），
+    # 而计数由主线程写，读的时候要和其他统计路径一个口径（SLF-10）。
+    rules = list(_log_filter.rules)
+    with _state_mutex():
+        stale = _collect_stale(_state, rules, _config.stale_rule_threshold)
     if stale:
         _emit_stale_warning(server, stale, _config.stale_rule_threshold)
 """
@@ -49,14 +56,14 @@ def disable_warning(src):
 
 def threshold_off_by_one(src):
     return src.replace(
-        "if entry is not None and entry.zero_streak >= threshold:",
-        "if entry is not None and entry.zero_streak > threshold:  # mutation",
+        "if entry is not None and entry.zero_streak >= threshold and rule.count == 0:",
+        "if entry is not None and entry.zero_streak > threshold and rule.count == 0:  # mutation",
     )
 
 def drop_startup_guard(src):
     return src.replace(
-        "if _session_reached_startup and _state is not None:",
-        "if _state is not None:  # mutation",
+        "    if _session_reached_startup:\n",
+        "    if True:  # mutation: startup guard dropped\n",
     )
 
 def break_carry_over(src):
@@ -95,7 +102,6 @@ def warn_before_startup(src):
             _emit_stale_warning(server, _m, _config.stale_rule_threshold)
 """
     return src.replace(ON_START_TAIL, early, 1)
-
 def inject_a_key_into_the_config(src):
     """往配置里塞一个非选项键（模拟「自己加注释」的诱惑）。
 
@@ -179,8 +185,13 @@ def silence_reset_announcement(src):
     return src.replace(anchor, "    return reason  # mutation: reset not announced\n" + anchor, 1)
 
 
-PRUNE_ON_LOAD = "    _announce_pruned(server, _prune_state(server, _state, _config.patterns))\n"
-PRUNE_ON_RELOAD = "    pruned = [] if _state is None else _prune_state(server, _state, _config.patterns)\n"
+PRUNE_ON_LOAD = (
+    "    _announce_pruned(server, _prune_state(server, _state, _config.patterns))\n"
+)
+PRUNE_ON_RELOAD = (
+    "    configured = list(_config.patterns)\n"
+    "    pruned = [] if _state is None else _prune_state(server, _state, configured)\n"
+)
 PRUNE_CALL = "    removed = _forget_orphans(state, patterns)\n"
 RESET_GUARD = "    if _config_was_reset:\n"
 
@@ -211,7 +222,9 @@ def ignore_the_reset_guard(src):
 # language file rather than Python, which is why every entry below names its target.
 
 LANGUAGE_ASSIGN = "    _language = _resolve_language(server, setting)\n"
-MCDR_LOOKUP = "    choice = i18n.resolve(setting, _mcdr_language(server))\n"
+# Anchor on the *callee* rather than the whole call: `_resolve_language` now passes an
+# extra `notes=` bucket, so a full-statement anchor drifts on every signature change.
+MCDR_LOOKUP = "            _mcdr_language(server),\n"
 NOTE_GUARD = "    if choice.note_key is not None and warn:\n"
 CATALOG_GUARD = "    if problem is not None and warn:\n"
 QUARANTINE_LANGUAGE = (
@@ -234,7 +247,9 @@ def ignore_the_language_option(src):
 
 def ignore_the_mcdr_language(src):
     """auto 不再跟随 MCDR，直接落回默认语言。"""
-    return src.replace(MCDR_LOOKUP, "    choice = i18n.resolve(setting, None)  # mutation\n")
+    return src.replace(
+        MCDR_LOOKUP, "            None,  # mutation: do not ask MCDR\n"
+    )
 
 
 def skip_the_catalogues(src):
@@ -250,6 +265,19 @@ def silence_the_unknown_language_warning(src):
 def silence_the_unreadable_catalogue_warning(src):
     """语言文件坏掉也不吭声。"""
     return src.replace(CATALOG_GUARD, "    if False:  # mutation\n", 1)
+
+
+def silence_the_language_probe_failures(src):
+    """探测性失败（语言探测 / 语言目录列举）不再留痕 —— 中文管理员会突然看到英文。"""
+    return src.replace(
+        "def _note(key: str, key_name: str, **kwargs) -> None:\n"
+        '    """在当前上下文的诊断表里记一条（没有上下文就丢弃，绝不抛异常）。"""\n'
+        "    bucket = _notes.get()\n",
+        "def _note(key: str, key_name: str, **kwargs) -> None:  # mutation: swallow\n"
+        "    return\n"
+        "    bucket = _notes.get()\n",
+        1,
+    )
 
 
 def ignore_the_language_in_a_broken_config(src):
@@ -285,18 +313,23 @@ def raise_on_an_undecodable_config(src):
 
 
 def drop_the_probe_floor(src):
-    """去掉探测预算的下限 —— 预算写成 0 时每一条规则都会被判成「太慢」而拒掉。"""
+    """去掉探测预算的下限 —— 预算写成 0 时每一条规则都会被判成「太慢」而拒掉。
+
+    上限保留（否则 0 会被上限"顺手救回来"，变成一次等价变异，测试永远抓不到）。
+    """
     return src.replace(
-        "        probe_budget_ms = max(1, probe_budget_ms)\n",
-        "        pass  # mutation: no floor\n",
+        "        clamped = min(MAX_PROBE_BUDGET_MS, max(MIN_PROBE_BUDGET_MS, probe_budget_ms))\n",
+        "        clamped = min(MAX_PROBE_BUDGET_MS, probe_budget_ms)  # mutation: no floor\n",
     )
 
 
 def drop_the_test_prefix_strip(src):
     """!!logfilter test 不再剥掉控制台前缀 —— `^` 锚定的规则会被误报成不命中。"""
     return src.replace(
-        '    body = _LOG_LINE_PREFIX.sub("", text, count=1) or text\n',
-        "    body = text  # mutation: no prefix strip\n",
+        "    if _LOG_LINE_PREFIX.match(text):\n"
+        '        body = _LOG_LINE_PREFIX.sub("", text, count=1)\n',
+        "    if False:  # mutation: no prefix strip\n"
+        '        body = _LOG_LINE_PREFIX.sub("", text, count=1)\n',
     )
 
 
@@ -430,6 +463,72 @@ def zero_the_counts_on_a_command_reload(src):
     )
 
 
+def count_only_the_first_matching_rule(src):
+    """SLF-02 的回归锚点：命中路径又回到「只给第一条计数」。
+
+    这一条是本次修复的核心承诺，必须有变异守着——否则以后有人为了省这点开销把它
+    改回去，测试不会变红。
+    """
+    return src.replace(
+        "        hit: List[Rule] = []\n"
+        "        for rule in self._rules:\n"
+        "            if rule.regex.search(content):\n"
+        "                hit.append(rule)\n",
+        "        hit: List[Rule] = []\n"
+        "        for rule in self._rules:\n"
+        "            if rule.regex.search(content):\n"
+        "                hit.append(rule)\n"
+        "                break  # mutation: only the first rule is counted\n",
+    )
+
+
+def stale_criterion_drops_the_session_count(src):
+    """SLF-02/05 的判据回归：``_collect_stale`` 不再看「本轮是否真的零命中」。"""
+    return src.replace(
+        "if entry is not None and entry.zero_streak >= threshold and rule.count == 0:",
+        "if entry is not None and entry.zero_streak >= threshold:  # mutation\n",
+    )
+
+
+def drop_the_type_level_quarantine(src):
+    """SLF-04：类型写坏的配置不再被检疫（会被 MCDR 的 REGEN 静默覆盖）。"""
+    return src.replace(
+        "                reason = _type_error_reason(parsed, say)\n"
+        "                if reason is None:\n"
+        "                    return None          # 四种「写坏」都不成立，交给 MCDR\n",
+        "                return None  # mutation: no type-level quarantine\n",
+    )
+
+
+def drop_the_state_quarantine(src):
+    """SLF-08：state.json 损坏时不再备份，直接走 MCDR 的静默重置。"""
+    return src.replace(
+        "        _quarantine_broken_state(server, STATE_FILE_NAME)\n",
+        "        pass  # mutation: state.json not quarantined\n",
+    )
+
+
+def drop_the_state_lock(src):
+    """SLF-08：``_state`` 的读改写不再互斥。"""
+    return src.replace(
+        "    with _state_mutex():\n        state.session_index += 1\n",
+        "    if True:  # mutation: no state lock\n        state.session_index += 1\n",
+    )
+
+
+def drop_the_reload_try(src):
+    """SLF-15：``!!lf reload`` 又没有异常兜底。
+
+    去掉 ``except`` 子句，让异常直接穿出命令处理器——这正是修复前的状态。
+    保留 ``try:`` 是为了不动缩进（重排整段的变异很容易写成不合法代码）。
+    """
+    return src.replace(
+        "    except Exception as error:  # noqa: BLE001 - 命令面必须给出可读回复\n",
+        "    except KeyboardInterrupt as error:  # mutation: no guard for real failures\n",
+        1,
+    )
+
+
 def report_only_the_first_matching_rule(src):
     """`test` 又只报第一条命中规则。"""
     return src.replace(
@@ -442,7 +541,7 @@ def report_only_the_first_matching_rule(src):
 def drop_the_catch_all_guard(src):
     """去掉「匹配一切」守卫 —— 一个字符的打错又能静音整个控制台且毫无提示。"""
     return src.replace(
-        "            if _matches_everything(regex):\n",
+        "            if _matches_everything(regex) or _hides_every_blank_line(regex):\n",
         "            if False:  # mutation\n",
     )
 
@@ -569,6 +668,26 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "keeps_line_numbers"]),
     ("counts zeroed on a command reload", SRC, zero_the_counts_on_a_command_reload,
      ["tests/test_plugin.py", "-k", "does_not_fake_an_idle_session or counts_of_rules_that_survive"]),
+    ("only the first matching rule is counted", SRC, count_only_the_first_matching_rule,
+     ["tests/test_plugin.py", "-k",
+      "shadowed or every_matching_rule_is_counted or really_does_not_match or no_longer_short_circuits"]),
+    ("the stale criterion ignores this session's count", SRC,
+     stale_criterion_drops_the_session_count,
+     ["tests/test_plugin.py", "-k",
+      "matched_this_session or skipped_session or shadowed or single_hit_resets"]),
+    ("a type-broken config is not quarantined", SRC, drop_the_type_level_quarantine,
+     ["tests/test_plugin.py", "-k",
+      "type_error or type_mismatch or sound_config_is_not_touched"]),
+    ("a broken state.json is not quarantined", SRC, drop_the_state_quarantine,
+     ["tests/test_plugin.py", "-k", "broken_state_file or type_broken_state or loading_the_state"]),
+    ("state updates take no lock", SRC, drop_the_state_lock,
+     ["tests/test_plugin.py", "-k",
+      "state_updates_take_the_module_lock or concurrent_state_writers"]),
+    ("the reload command has no exception guard", SRC, drop_the_reload_try,
+     ["tests/test_plugin.py", "-k", "reload_command_replies_instead"]),
+    ("language probe failures swallowed silently", SRC, silence_the_language_probe_failures,
+     ["tests/test_plugin.py", "-k",
+      "failing_language_probe or failing_mcdr_language or listing_failure or unfilled_placeholders"]),
     ("only the first matching rule reported", SRC, report_only_the_first_matching_rule,
      ["tests/test_plugin.py", "-k", "lists_every_matching_rule"]),
     ("the catch-all guard dropped", SRC, drop_the_catch_all_guard,
@@ -580,19 +699,115 @@ MUTATIONS = [
      ["tests/test_plugin.py", "-k", "identical_bytes or pinned_timestamp"]),
 ]
 
+#: pytest 摘要里两个必须分开看的数字。**这是本工具最重要的判据**：
+#: ``failed`` 是"测试真的没通过"（变异被抓到），``error`` 是 fixture / 收集期出错
+#: （环境坏了、锚点写歪了）。两者的退出码都是 1，只看退出码会把它们混成一个数，
+#: 于是"测试有牙齿"和"环境坏掉"在这张表上不可区分（这就是 SLF-07 的一半）。
+SUMMARY_RE = re.compile(
+    r"(?:(?P<failed>\d+)\s+failed)?"
+    r"(?:,?\s*(?P<error>\d+)\s+error)?"
+    r"(?:,?\s*(?P<passed>\d+)\s+passed)?"
+)
+
+
+def _parse_summary(text: str) -> dict:
+    """从 pytest 的 ``-q`` 输出里取出 ``failed`` / ``error`` / ``passed`` 计数。
+
+    取不到的计数按 **0** 处理（"1 passed, 338 deselected" 里没有 failed/error，
+    那就是 0 个），并从最后一行往前找第一条带计数的行。
+    """
+    counts = {"failed": 0, "error": 0, "passed": 0, "no_tests": False, "parsed": False}
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not any(
+            word in stripped
+            for word in ("failed", "error", "passed", "deselected", "no tests ran")
+        ):
+            continue
+        if "no tests ran" in stripped:
+            counts["no_tests"] = True
+            return counts
+        matched = False
+        for match in SUMMARY_RE.finditer(stripped):
+            for key in ("failed", "error", "passed"):
+                value = match.group(key)
+                if value is not None:
+                    counts[key] = int(value)
+                    matched = True
+        if matched:
+            counts["parsed"] = True
+            return counts
+    return counts
+
+
+def _purge_bytecode(root: Path) -> int:
+    """删掉 ``root`` 下所有 ``__pycache__``，返回删掉的目录数。
+
+    必须在**每次 pytest 运行前后**都做：变异改写的是源码，而 ``.pyc`` 是按
+    (mtime, size) 失效的——同一秒内写完、大小又恰好相同的两次内容（变异与还原就是
+    这样）会让 CPython 继续用旧字节码，于是"变异了但测试跑的是原版"，表现为
+    不可复现的假存活。这也是 SLF-07 里那条"全量跑存活、单条复跑抓到"的直因。
+    """
+    removed = 0
+    for cache in list(root.rglob("__pycache__")):
+        if cache.is_dir():
+            shutil.rmtree(cache, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def pytest_ok(workdir, selector):
+    """跑一次 pytest，返回 ``(退出码, 摘要行, 计数)``。
+
+    隔离掉字节码缓存（见 ``_purge_bytecode``），并显式关掉字节码写入 —— 这样"变异
+    到底有没有被跑起来"就只取决于磁盘上的源码。
+    """
+    _purge_bytecode(workdir)
     env = dict(os.environ)
     env["PYTHONPATH"] = ".testlibs"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
         [sys.executable, "-m", "pytest"] + selector + ["-q", "--no-header", "-p", "no:cacheprovider"],
         cwd=str(workdir), env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=600,
     )
-    lines = [l.strip() for l in (proc.stdout + proc.stderr).splitlines() if l.strip()]
-    summary = next((l for l in reversed(lines)
-                    if "passed" in l or "failed" in l or "error" in l), "(no summary)")
-    return proc.returncode, summary
+    _purge_bytecode(workdir)
+    text = proc.stdout + proc.stderr
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    summary = next((line for line in reversed(lines)
+                    if "passed" in line or "failed" in line or "error" in line
+                    or "no tests ran" in line), "(no summary)")
+    return proc.returncode, summary, _parse_summary(text)
+
+
+def verdict(returncode, counts, summary):
+    """把一次 pytest 运行判成 ``caught`` / ``SURVIVED`` / ``HARNESS`` / ``ERRORS-ONLY``。
+
+    **顺序要紧**：先看收集（退出码 4/5 / "no tests ran"），再看 ``failed``，
+    最后才看退出码。反过来写会把"有 failed"也当成 HARNESS —— 那个 bug 让整表 37 条
+    被误报成"锚点失效"，而它们其实条条都抓住了。
+
+    * ``caught``      —— 有 ``failed``：测试真的没通过，变异被抓住。
+    * ``SURVIVED``    —— 退出码 0、测试全绿：变异活下来了。
+    * ``ERRORS-ONLY`` —— 退出码非 0 但一个 ``failed`` 都没有：fixture / 收集期出错。
+      **不算抓住**；这正是把环境问题误判成"测试有牙齿"的那一类。
+    * ``HARNESS``     —— 退出码 4/5 或没有测试被收集：选择器过期了。
+    """
+    if counts.get("no_tests") or returncode in (4, 5):
+        return "HARNESS"
+    if counts.get("failed"):
+        return "caught"
+    if returncode != 0:
+        return "ERRORS-ONLY"
+    return "SURVIVED"
+
 
 def main():
     # 至少有一条变异只有端到端测试能抓住（``arrives_after``）。跳过 e2e 的话，
@@ -607,9 +822,11 @@ def main():
         return 1
 
     workdir = Path(tempfile.mkdtemp(prefix="mutation_check_"))
+    print("workdir: {}".format(workdir))
     shutil.copytree(REPO, workdir / "repo",
-                    ignore=shutil.ignore_patterns(".git", ".pytest_cache"))
+                    ignore=shutil.ignore_patterns(".git", ".pytest_cache", "__pycache__"))
     repo = workdir / "repo"
+    print("purged {} __pycache__ dir(s) from the copy".format(_purge_bytecode(repo)))
     # One pristine copy per file a mutation touches, so a mutation can be undone
     # without rebuilding the tree.
     baselines = {
@@ -617,22 +834,24 @@ def main():
         for _, relative, _, _ in MUTATIONS
     }
 
-    code, summary = pytest_ok(repo, ["tests/test_plugin.py", "-k",
-                                     "stale or idle or threshold or reload_does_not_fake or "
-                                     "never_reached_startup or catastrophic or migrator or "
-                                     "no_comment_fields or has_a_description or "
-                                     "generated_config_contains_only or prun or "
-                                     "rejected_by_the_safety_probe or switch or "
-                                     "leniently or raw_bool or language or english or "
-                                     "auto or catalogue or translation or packed_plugin"])
+    code, summary, counts = pytest_ok(repo, ["tests/test_plugin.py", "-k",
+                                             "stale or idle or threshold or reload_does_not_fake or "
+                                             "never_reached_startup or catastrophic or migrator or "
+                                             "no_comment_fields or has_a_description or "
+                                             "generated_config_contains_only or prun or "
+                                             "rejected_by_the_safety_probe or switch or "
+                                             "leniently or raw_bool or language or english or "
+                                             "auto or catalogue or translation or packed_plugin"])
     print("baseline (unmutated): exit={} {}".format(code, summary))
-    if code != 0:
+    if code != 0 or counts.get("failed") or counts.get("error"):
         print("baseline is not green — fix the tests first")
         return 1
     print()
 
     killed = 0
-    broken = []           # 锚点失效的变异：是脚本自己过期了，不是测试没抓住
+    broken = []           # 锚点失效 / 选择器过期：是脚本自己过期了，不是测试没抓住
+    noisy = []            # 只 error 不 failed：环境坏了，不能算抓住
+    survived = []         # 测试全绿：变异活下来了
     for name, relative, mutate, selector in MUTATIONS:
         baseline = baselines[relative]
         mutated = mutate(baseline)
@@ -648,32 +867,53 @@ def main():
                 print("  !! {:<52} mutated code does not compile: line {}".format(
                     name, error.lineno))
                 continue
-        (repo / relative).write_text(mutated, encoding="utf-8")
-        code, summary = pytest_ok(repo, selector)
-        (repo / relative).write_text(baseline, encoding="utf-8")
+        target = repo / relative
+        target.write_text(mutated, encoding="utf-8")
+        # 把"这次变异到底往盘上写了什么"钉成可复核的指纹：报告里出现假存活时，
+        # 第一件事就是拿它和手工注入的结果比对。
+        digest = _sha256(target)
+        try:
+            code, summary, counts = pytest_ok(repo, selector)
+        finally:
+            target.write_text(baseline, encoding="utf-8")
 
-        if code == 1:
-            print("  caught   {:<52} {}".format(name, summary))
+        outcome = verdict(code, counts, summary)
+        detail = "exit={} {}".format(code, summary)
+        if outcome == "caught":
+            print("  caught      {:<52} sha256={} {}".format(name, digest[:12], detail))
             killed += 1
-        elif code in (4, 5):
-            print("  HARNESS  {:<52} exit={} — selector matched nothing".format(name, code))
+        elif outcome == "HARNESS":
+            broken.append(name)
+            print("  HARNESS     {:<52} {} — selector matched nothing".format(name, detail))
+        elif outcome == "ERRORS-ONLY":
+            noisy.append(name)
+            print("  ERRORS-ONLY {:<52} {} — errors, NOT failures".format(name, detail))
         else:
-            print("  SURVIVED {:<52} exit={} {}".format(name, code, summary))
+            survived.append(name)
+            print("  SURVIVED    {:<52} sha256={} {}".format(name, digest[:12], detail))
 
     print()
-    print("caught {}/{}".format(killed, len(MUTATIONS)))
-    shutil.rmtree(workdir, ignore_errors=True)
-    # 「锚点失效」跟「测试没抓住」是两回事：前者是脚本自己过期了（多半是重构挪走了那一行），
-    # 后者才是测试的问题。但两种都必须失败退出 —— 一个失效的锚点等于少测一项。
-    survived = len(MUTATIONS) - killed - len(broken)
+    print("caught {} / {}".format(killed, len(MUTATIONS)))
+    print("  survived (tests are decorative):      {}".format(len(survived)))
+    print("  errors only (environment, not tests): {}".format(len(noisy)))
+    print("  harness (stale anchor or selector):   {}".format(len(broken)))
+    if survived:
+        print("survived mutations — the corresponding tests are decorative:")
+        for name in survived:
+            print("   - {}".format(name))
+    if noisy:
+        print("mutations whose run only produced errors (NOT counted as caught):")
+        for name in noisy:
+            print("   - {}".format(name))
     if broken:
-        print("{} mutation(s) could not be applied — the anchors are stale:".format(len(broken)))
+        print("mutations that could not be applied / selected:".format())
         for name in broken:
             print("   - {}".format(name))
-    if survived:
-        print("{} mutation(s) survived — the corresponding tests are decorative".format(survived))
-    if broken or survived:
+    if survived or noisy or broken:
+        print()
+        print("the temporary tree is kept for inspection: {}".format(repo))
         return 1
+    shutil.rmtree(workdir, ignore_errors=True)
     print("every mutation was caught — the tests have teeth")
     return 0
 

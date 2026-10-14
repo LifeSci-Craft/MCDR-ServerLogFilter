@@ -108,6 +108,24 @@ def mcdr_version(python: str) -> str:
     return proc.stdout.strip() or "unknown"
 
 
+def catalogue() -> dict:
+    """The shipped Chinese catalogue, read rather than quoted.
+
+    Every assertion below that looks for a *sentence* reads it from here. The alternatives are
+    two failures this file has already had: a phrase written down here goes stale the moment the
+    message is reworded (the stale-rule warning was reworded from "连续 N 次零命中" to "从未命中"
+    and this tool started reporting "the warning never appeared"), and a phrase written in the
+    plugin's own file is not something this tool should own. Read from the artifact's source of
+    truth, exactly like ``plugin_badge()`` reads the name.
+    """
+    path = REPO / "server_log_filter" / "lang" / "zh_cn.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def phrase(key: str, **kwargs) -> str:
+    return catalogue()[key].format(**kwargs)
+
+
 def run_one(python: str, plugin: Path, workdir: Path) -> dict:
     root = workdir / ("mcdr_" + "".join(c if c.isalnum() else "_" for c in mcdr_version(python)))
     if root.is_dir():
@@ -177,7 +195,10 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
     loaded = "已启用 3 条日志过滤规则" in out
     dep_blocked = "不满足版本约束" in out
     done_at = out.find(STARTUP_LINE)
-    warn_at = out.find("都没有命中")
+    # One stale rule, and the seeded config sets ``stale_rule_threshold`` to THRESHOLD, so the
+    # warning header interpolates to exactly this sentence.
+    warning_marker = phrase("stale.title", count=1, threshold=THRESHOLD)
+    warn_at = out.find(warning_marker)
 
     state_path = root / "config" / PLUGIN_ID / "state.json"
     state = {}
@@ -205,9 +226,9 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
         "warning_names_rule": IDLE in out,
         # The idle streak lives in the header, not per rule. The seeded streak (5)
         # exceeds the threshold (2), so this rule does get the short annotation.
-        "warning_states_streak_once": out.count("都没有命中") == 1,
-        "warning_annotates_longer_streak": "（已连续 {} 次零命中）".format(
-            SEEDED_SESSION
+        "warning_states_streak_once": out.count(warning_marker) == 1,
+        "warning_annotates_longer_streak": phrase(
+            "stale.entry_extra", streak=SEEDED_SESSION
         ) in out,
         "state_written": bool(state.get("session_index")),
         "session_advanced": state.get("session_index") == SEEDED_SESSION + 1,
