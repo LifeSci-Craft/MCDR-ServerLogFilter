@@ -194,7 +194,6 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
         "stale_rule_threshold": THRESHOLD,
         "validate_patterns": True,
         "pattern_probe_timeout_ms": 25,
-        "announce_config_upgrade": True,
         "announce_broken_config": True,
     }, indent=2))
     write(root / "config" / PLUGIN_ID / "state.json", json.dumps({

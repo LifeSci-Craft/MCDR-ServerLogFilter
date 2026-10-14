@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**378 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**363 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**、**多语言**、**并发**，以及本插件最核心的
 安全属性（被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -40,7 +40,7 @@ CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过�
 预期输出结尾：
 
 ```
-376 passed
+363 passed
 ```
 
 > **开发中不用每次都跑全量。** 改哪一块就只跑那一块，确认当前版本能过即可，例如
@@ -62,19 +62,19 @@ CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过�
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
 | 发布打包 | 7 | 见下 |
 | **零命中提醒** | **22** | 阈值语义、命中归零、启动失败不计入、热重载不误判、可关闭、`reset`、历史持久化、**以及「不重复输出」**，见下；另含**删除规则后统计立刻清除**（重载 / 命令两条路径、不写多余文件、不误删被拦下的规则、配置被重置时不动） |
-| **灾难性回溯防护** | **37** | 8 种真实写法全部放行；多种危险模式被拦下（**其中 `(a\|aa)+$` 在长探测串上会让单次 `re.search` 跑几十小时，所以这类用例跑在带超时的子进程里**）；增长判据与长度上限、预算上下限、开关与超时可配置且**确实接在 `on_load` 上**；**预算写成 0/负数时不会把规则全部拒掉** |
+| **灾难性回溯防护** | **39** | 8 种真实写法全部放行；多种危险模式被拦下（**其中 `(a\|aa)+$` 在长探测串上会让单次 `re.search` 跑几十小时，所以这类用例跑在带超时的子进程里**）；增长判据与长度上限、预算上下限、开关与超时可配置且**确实接在 `on_load` 上**；**预算写成 0/负数时不会把规则全部拒掉** |
 | **轻量化不变量** | **6** | 热路径的结构性断言（缓存 `hidden()`、无规则短路、不再短路但保留"第一条命中"语义），外加两条宽松的耗时护栏 |
 | **类型写坏的配置** | **11** | 合法 JSON 但字段类型不符时走与语法错**同一条**备份 + 播报路径（旧版会被 MCDR 的 REGEN 静默覆盖）；三种既有检疫行为不受影响；未来版本多出来的键不算类型错 |
-| **升级提示与迁移** | **15** | 见下；含**升级提示开关**本身的语义（关了不播、但配置照补） |
+| **配置补齐与迁移** | **1** | 配置里不得出现非选项键；新增选项由 MCDR 自己补齐（升级播报已在 1.4.3 移除），迁移路径由端到端组覆盖 |
 | **坏配置的保全与重建** | **13** | 见下 |
 | **写坏提示的开关** | **11** | 开关从**写坏的原文**里读取（大小写 / 空格 / 位置随意、同名后缀不算、找不到按默认开启）；被静默的只有消息，备份照做；「连备份都失败」不受开关影响 |
 | **语言（i18n）** | **35** | 见下；`auto` 双向跟随、显式值压过 MCDR、宽松识别、未知语言回落、坏目录不崩、**探测失败会留一条可读 warning（旧版是静默 `except: pass`）**、**打包后仍读得到文案**、英文真的到达每一处输出，外加一整套目录结构不变式 |
 | **命令面、权限、界面与打包** | **49** | `!!lf` 别名（一个节点两条字面量）、帮助页、`help`/`list` 的接线，以及 4 条在**真 MCDR** 上真的敲一遍命令的端到端 |
 | **1.4.1 的修复与守卫** | **25** | 命令重载接续计数（3）、`test` 列出全部命中（1）、匹配一切的规则被警告但保留（11，含 7 条参数化）、重复规则去重（3）、以及对应的接线 |
 | **1.3.0 的修复** | **9** | 非 UTF-8 配置被备份而非致命（2）、`test` 剥掉控制台前缀（2）、状态里显示语言来源与被跳过的规则（2）、量化符溢出与深层嵌套不再致命（2）、坏模板的 `AttributeError`（1） |
-| **端到端（真实 MCDR）** | **37** | 见下。这一项是**独立的一整份文件**（`tests/test_e2e.py`），不与上面各组的用例重叠 |
+| **端到端（真实 MCDR）** | **35** | 见下。这一项是**独立的一整份文件**（`tests/test_e2e.py`），不与上面各组的用例重叠 |
 | **生命周期与并发** | **14** | `on_load` 提前 return（低版本 MCDR）之后走完整生命周期不抛异常、模块级全局被显式重置；`state.json` 损坏时备份 + 告警；`_state` 的读改写共用一把锁；多线程真实入口小规模压测 |
-| **合计** | **376** | |
+| **合计** | **363** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
 
@@ -104,7 +104,7 @@ CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过�
 | `test_plugin_generated_its_default_config` | 首次运行生成 `config/server_log_filter/config.json`，字段与默认值正确 |
 | `test_a_deleted_rule_is_announced_as_cleaned_up` | **同一个实例目录跑两次 MCDR**，中间删掉一条规则；第二次启动时控制台出现「已清除」提示（这句只在载入阶段打印，因此能证明清理发生在重载那一刻） |
 | `test_a_deleted_rule_leaves_the_state_file` | 第二次运行后 `state.json` 里已无该规则，存活规则历史完好，`session_index == 2` |
-| `test_auto_follows_mcdr_language_end_to_end` | 实例**不写** `language` 键、MCDR 设为 `en_us` → 插件输出全英文（同时顺带走一遍 1.2.2 的升级提示，因为它也在英文里） |
+| `test_auto_follows_mcdr_language_end_to_end` | 实例**不写** `language` 键、MCDR 设为 `en_us` → 插件输出全英文 |
 | `test_auto_follows_mcdr_into_chinese_too` | 实例**不写** `language` 键、MCDR 设为 `zh_cn` → 插件输出**中文**。这条专治一个易混点：`auto` 读的是 MCDR **当前**的 `language`，不是某个内置默认值（两个方向都测才能区分这两种实现） |
 | `test_an_explicit_language_beats_the_mcdr_setting_end_to_end` | MCDR 设为 `zh_cn`、插件写 `en_us` → 插件那几行仍是英文（MCDR 自己的界面文案按它自己的设置走，所以断言只盯插件输出的那几条） |
 | `test_the_packaged_plugin_carries_its_language_files` | 解开发布包，`lang/*.json` 在里面，且键集与源码目录一致 |
@@ -255,33 +255,23 @@ if handler.test_server_startup_done(info):
 `test_on_load_respects_validate_patterns_false` / `test_on_load_honours_the_timeout_setting`
 之后才守得住。
 
-## 升级提示与迁移（第 11 组）
+## 配置补齐与迁移（第 11 组）
 
-两条不变量是这一组的核心：
+MCDR 自己会把旧配置里缺的选项按默认值补进文件；插件不做这件事，也**不再播报「升级后新增了哪些
+选项」**（该功能在 1.4.3 移除）。这一组现在守的是一条形状不变量：
 
-1. **每个配置项都必须写明加入版本。**
-   `test_every_config_option_has_a_description` 断言 `CONFIG_DOC` 的键集合与 `Config` 的真实字段
-   完全一致，且每条的版本号形如 `X.Y.Z`。于是「新增了配置项却忘了写说明」会直接让测试失败
-   ——那会让升级提示里出现一条没有说明的条目。
-2. **配置里不得出现任何非选项键。**
-   `test_the_generated_config_has_no_comment_fields` 断言生成的配置**恰好**等于选项集合。
+- **配置里不得出现任何非选项键。**
+  `test_the_generated_config_has_no_comment_fields` 断言生成的配置**恰好**等于选项集合。
 
-> 第 2 条来自一次反复：早期版本为了让配置「自带注释」，往文件里注入过一批 `#<选项名>` 字段。
+> 这条来自一次反复：早期版本为了让配置「自带注释」，往文件里注入过一批 `#<选项名>` 字段。
 > 功能上可行，但让配置文件看起来复杂，最终被移除。
 > 这条用例就是为了防止它（或任何类似的键）再溜回来。
 
-升级提示本身由 `test_upgrade_announcement_lists_options_with_versions` /
-`test_upgrade_announcement_explains_each_new_option` 等用例守住——
-**只报选项名不够，得说清它是干什么的**。
-
-迁移路径本身由**端到端组**覆盖：`_build_instance` 种下的配置只有 1.0.x 的三个选项，
-所以每次跑 e2e 都在真实 MCDR 上走一遍「旧配置 → 自动补齐 → 日志提示」的完整流程。
-
-> 与第 9 组同一个教训：这里也有**接线**用例（`test_on_load_wires_the_migrator_into_config_loading`、
-> `test_reload_command_also_migrates`）。函数本身正确，不等于它真的被挂到了加载路径上。
+迁移路径由**端到端组**覆盖：`_build_instance` 种下的配置只有 1.0.x 的三个选项，
+所以每次跑 e2e 都在真实 MCDR 上走一遍「旧配置 → 自动补齐」的完整流程。
 
 > 配对实验：`tools/mutation_check.py` 里有一条变异往配置里塞一个非选项键，
-> 用来证明第 2 条不变量真的在起作用。
+> 用来证明上面这条不变量真的在起作用。
 
 
 
@@ -325,8 +315,6 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
   后者是明确的错误输入，静默会让人以为设置生效了。
 - **翻译失败绝不抛异常。** 模板 `format()` 出问题（比如译文漏了占位符）时返回**原文**，
   缺 key 时逐级回落，最后退化成键名——**日志插件的消息面不能成为新的故障点**。
-- **配置说明也走查表。** `CONFIG_DOC` 存的是**语言键**而不是中文句子，
-  于是「每个选项都有说明」这条不变式对**每一种语言**同时成立，说明文字也不会随语言漂移。
 - **坏配置那条路只能从文件原文读语言**（`_raw_str_option`），因为在那一刻配置尚未解析成功；
   且内部用 `warn=False` 解析一次，避免同一条警告说两遍。
 
@@ -339,7 +327,6 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 | 模板里的占位符集合一致 | `test_every_translation_keeps_the_placeholders` |
 | 代码里用到的键**全部存在** | `test_every_key_the_code_asks_for_exists_in_every_catalogue` |
 | **没有键是没人用的**（反向） | `test_no_catalogue_key_is_left_unused` |
-| `CONFIG_DOC` 的键 == `Config` 的字段 | `test_the_config_descriptions_are_exactly_the_options` |
 | `en_us` 里不含 CJK 字符 | `test_the_english_catalogue_is_actually_english` |
 
 > 前两条不变式靠 **AST** 实现：遍历源码里所有 `_t(...)` / `say(...)` / `translate(...)`
@@ -348,7 +335,7 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 > 而不需要人工维护一份键名单——那种名单迟早会和代码脱节。
 
 > 「翻译有没有真的到达用户面前」另有一组用例逐处验证：零命中提醒、命令与运行摘要、
-> 删规则播报与规则报错、升级提示，都在英文下检查过。
+> 删规则播报与规则报错、坏配置提示，都在英文下检查过。
 > 结构对了不等于接上了，这一课在第 9 组（灾难性回溯防护）已经吃过一次。
 
 判断一组测试有没有效，唯一可靠的办法是**故意把实现改坏，看测试会不会变红**。
@@ -375,10 +362,7 @@ python tools/mutation_check.py
 | 热重载计数接续失效 | `test_reload_does_not_fake_an_idle_session` |
 | 热重载丢失「本周期已完成启动」标记 | `test_reload_carries_the_running_session_over_to_the_new_module` |
 | 配置里被塞进一个非选项键 | `test_the_generated_config_has_no_comment_fields` 等 |
-| 静默升级提示 | `test_upgrade_announcement_lists_options_with_versions` 等 |
-| 无视 `announce_config_upgrade`（关了照播） | `test_upgrade_announcement_can_be_switched_off`、`test_the_upgrade_switch_survives_a_reload` |
 | 无视 `announce_broken_config`（关了照播） | `test_broken_config_notice_can_be_switched_off`、`test_the_switch_is_read_leniently_from_the_raw_file` |
-| 某个配置项丢掉说明 | `test_every_config_option_has_a_description` |
 | 不再检查配置文件（坏文件被直接覆盖） | `test_on_load_checks_the_config_file` 等 |
 | 检测到问题但不备份 | `test_broken_config_is_backed_up_before_being_regenerated` |
 | 恢复成「每条规则都重复零命中次数」 | `test_a_rule_at_exactly_the_threshold_gets_no_annotation` 等 |

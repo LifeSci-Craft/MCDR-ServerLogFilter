@@ -107,23 +107,17 @@ def inject_a_key_into_the_config(src):
 
     配置里除了真正的选项不该有任何键，否则文件会变复杂——这正是注释字段被移除的原因。
     注入后它会被当成一个真字段，于是生成的 config.json 里会多出一项。
+
+    锚点原来挂在 `_config_option_names()` 上；那个函数随 1.4.3 移除升级播报一起删掉了，
+    于是变异施加不上（工具会正确地把它算成「脚本自己过期」，而不是「测试没抓住」）。
     """
     return src.replace(
-        "def _config_option_names() -> List[str]:",
+        'BROKEN_CONFIG_NOTICE_OPTION = "announce_broken_config"\n',
+        'BROKEN_CONFIG_NOTICE_OPTION = "announce_broken_config"\n'
+        "\n"
+        "# mutation: the shape an earlier revision shipped to imitate JSON comments\n"
         'Config.__annotations__["#手写的注释"] = str\n'
-        'setattr(Config, "#手写的注释", "x")\n'
-        "\n"
-        "\n"
-        "def _config_option_names() -> List[str]:",
-        1,
-    )
-
-
-def drop_config_descriptions(src):
-    """让某个配置项不再有说明（升级提示里会变成「未记录说明」）。"""
-    return src.replace(
-        '    "patterns": (\n        "1.0.0",',
-        '    "patterns_UNUSED": (\n        "1.0.0",',
+        'setattr(Config, "#手写的注释", "x")\n',
         1,
     )
 
@@ -152,21 +146,6 @@ def repeat_streak_for_every_rule(src):
     return src.replace(
         DOC_SUFFIX_GUARD,
         "        if True:  # mutation: always annotate\n",
-    )
-
-def silence_upgrade_announcement(src):
-    """不再报告配置里新增了哪些选项（升级悄悄发生）。"""
-    return src.replace(
-        "    if config.announce_config_upgrade:\n        _announce_new_options(server)\n",
-        "    pass  # mutation: upgrade not announced\n",
-    )
-
-def ignore_the_upgrade_switch(src):
-    """无视 announce_config_upgrade —— 关了也照样播报。"""
-    return src.replace(
-        "    if config.announce_config_upgrade:\n",
-        "    if True:  # mutation: upgrade switch ignored\n",
-        1,
     )
 
 def ignore_the_broken_config_switch(src):
@@ -587,12 +566,6 @@ MUTATIONS = [
      ["tests/test_e2e.py", "-k", "arrives_after"]),
     ("a non-option key injected into the config", SRC, inject_a_key_into_the_config,
      ["tests/test_plugin.py", "-k", "no_comment_fields or generated_config_contains_only"]),
-    ("an option lost its description", SRC, drop_config_descriptions,
-     ["tests/test_plugin.py", "-k", "has_a_description"]),
-    ("upgrade announcement silenced", SRC, silence_upgrade_announcement,
-     ["tests/test_plugin.py", "-k", "announcement or announcement_lists"]),
-    ("the upgrade switch ignored", SRC, ignore_the_upgrade_switch,
-     ["tests/test_plugin.py", "-k", "switch"]),
     ("the broken-config switch ignored", SRC, ignore_the_broken_config_switch,
      ["tests/test_plugin.py", "-k", "switch or leniently"]),
     ("broken config no longer quarantined", SRC, drop_quarantine_call,
@@ -836,8 +809,8 @@ def main():
 
     code, summary, counts = pytest_ok(repo, ["tests/test_plugin.py", "-k",
                                              "stale or idle or threshold or reload_does_not_fake or "
-                                             "never_reached_startup or catastrophic or migrator or "
-                                             "no_comment_fields or has_a_description or "
+                                             "never_reached_startup or catastrophic or "
+                                             "no_comment_fields or "
                                              "generated_config_contains_only or prun or "
                                              "rejected_by_the_safety_probe or switch or "
                                              "leniently or raw_bool or language or english or "

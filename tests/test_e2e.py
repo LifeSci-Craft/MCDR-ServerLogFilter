@@ -411,7 +411,6 @@ def test_legacy_config_is_upgraded_in_place(e2e_output):
         "stale_rule_threshold",
         "validate_patterns",
         "pattern_probe_timeout_ms",
-        "announce_config_upgrade",
         "announce_broken_config",
     }
 
@@ -442,28 +441,6 @@ def slf_config_options():
     import server_log_filter
 
     return set(server_log_filter.Config.get_field_annotations())
-
-
-def test_upgrade_is_announced_with_versions(e2e_output):
-    """Adding options silently would leave admins unaware their config changed."""
-    output, _ = e2e_output
-    assert "配置已更新" in output, "the upgrade was not announced"
-
-    # 只用到 name；版本号由下面两条断言统一覆盖（`since` 不参与循环体）。
-    for name, _since in (
-        ("warn_about_stale_rules", "1.1.0"),
-        ("stale_rule_threshold", "1.1.0"),
-        ("validate_patterns", "1.1.0"),
-        ("pattern_probe_timeout_ms", "1.1.0"),
-        ("announce_config_upgrade", "1.2.1"),
-        ("announce_broken_config", "1.2.1"),
-    ):
-        assert name in output, "new option {} was not listed".format(name)
-    assert "v1.1.0 加入" in output
-    assert "v1.2.1 加入" in output
-    # `language` is deliberately not in this list: the harness seeds it (see
-    # _build_instance). The 1.2.2 upgrade path is covered by
-    # test_auto_follows_mcdr_language_end_to_end, whose config omits it.
 
 
 def test_plugin_keeps_its_state_file_out_of_the_user_config(e2e_output):
@@ -658,28 +635,8 @@ def test_plugin_still_works_after_a_config_reset(broken_config_e2e_output):
 
 
 # ---------------------------------------------------------------------------
-#  the two notice switches (announce_config_upgrade / announce_broken_config)
+#  the broken-config notice switch (announce_broken_config)
 # ---------------------------------------------------------------------------
-
-def test_upgrade_announcement_is_silent_when_switched_off(tmp_path_factory):
-    """Switching the notice off must not stop the config from being completed.
-
-    The run is seeded with a 1.0.x-era config *plus* the switch, so MCDR adds six
-    missing options. Normally that is announced; here the admin asked for quiet.
-    """
-    _require_mcdr()
-    root = tmp_path_factory.mktemp("mcdr_e2e_quiet_upgrade")
-    _build_instance(root, plugin_config={"announce_config_upgrade": False})
-    output = run_mcdr(root)
-
-    assert "配置已更新" not in output, "the notice was supposed to be silenced"
-
-    data = json.loads(
-        (root / "config" / "server_log_filter" / "config.json").read_text(encoding="utf-8")
-    )
-    assert set(data) == slf_config_options(), "the config must still be completed"
-    assert data["announce_config_upgrade"] is False, "the switch itself must survive"
-
 
 # The same missing-comma mistake as BROKEN_CONFIG, with the notice switched off.
 # The switch has to survive into the raw text: the file is unparseable, so it is
@@ -787,9 +744,7 @@ def test_auto_follows_mcdr_language_end_to_end(tmp_path_factory):
 
     ``language`` is omitted from the seeded config, so this exercises exactly the
     documented default (``auto``) against a real MCDR process — the one thing the
-    fake-server tests cannot prove, since they stub ``get_mcdr_language()`` out. It is
-    also the only run where ``language`` counts as a missing option, so it doubles as
-    the end-to-end check of the 1.2.2 upgrade notice.
+    fake-server tests cannot prove, since they stub ``get_mcdr_language()`` out.
     """
     _require_mcdr()
     root = tmp_path_factory.mktemp("mcdr_e2e_en")
@@ -797,12 +752,10 @@ def test_auto_follows_mcdr_language_end_to_end(tmp_path_factory):
     output = run_mcdr(root)
 
     assert "Enabled 2 log filter rule(s)" in output, output[-3000:]
-    assert "Config updated" in output
-    assert "added in v1.2.2" in output
     assert "Hidden 3 server log line(s)" in output, "the end-of-run summary must be English too"
 
     # and the plugin's own messages came out in English, not Chinese
-    for chinese in ("已启用", "配置已更新", "隐去", "加入"):
+    for chinese in ("已启用", "隐去"):
         assert chinese not in output, "untranslated output: {}".format(chinese)
 
 
