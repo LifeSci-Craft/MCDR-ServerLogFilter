@@ -73,7 +73,6 @@
     "stale_rule_threshold": 3,
     "validate_patterns": true,
     "pattern_probe_timeout_ms": 25,
-    "announce_config_upgrade": true,
     "announce_broken_config": true
 }
 ```
@@ -90,7 +89,6 @@
 | `stale_rule_threshold` | `int` | `3` | 连续多少个开服周期零命中才提醒；`0` = 关闭这项提醒 |
 | `validate_patterns` | `bool` | `true` | 载入时用短探测串检查灾难性回溯，把这类规则拦下并跳过 |
 | `pattern_probe_timeout_ms` | `int` | `25` | 上项检查里**单个探测串**的耗时上限（毫秒）：只影响插件加载与 `!!logfilter reload` 的耗时，与逐行过滤的开销无关（正常规则每行约 1 µs）。小于 1 按 1、大于 2000 按 2000，被钳制时在日志里 warning 一次。**这个检查是启发式**，拦不住所有病态正则（增长比低于阈值、或只在超长输入上才爆发的模式），详见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) |
-| `announce_config_upgrade` | `bool` | `true` | 升级后配置被自动补齐时，在控制台说明新增了哪些选项 |
 | `announce_broken_config` | `bool` | `true` | 配置写坏被备份并重置时，在控制台说明原因与备份路径 |
 
 </details>
@@ -113,7 +111,7 @@
 - 规则编译失败只会跳过该条并在日志里警告，其余规则照常工作；想临时关掉过滤，把 `patterns` 清空再 `!!logfilter reload`。
 - 零命中统计存在 `state.json`（与 `config.json` 分开，插件不会改你写的配置）；从配置里删掉规则，它的统计在 `reload` 时一并清除。
 - 写坏配置时，原文件先被改名成 `config.json.old` 再重建默认配置（备份只有这一个位置）；文件不是 UTF-8 编码（比如被存成 ANSI）也算写坏。
-- `warn_about_stale_rules` / `announce_config_upgrade` / `announce_broken_config` 三个播报开关**只管说不说**：备份、补齐、统计这些动作照旧执行。
+- `warn_about_stale_rules` / `announce_broken_config` 两个播报开关**只管说不说**：备份、统计这些动作照旧执行。升级后新增的选项由 MCDR 自己补进配置文件（不播报）。
 - 想加一门语言：复制 `en_us.json` 改成 `<语言代码>.json`、只翻译取值，见 `server_log_filter/lang/README.md`（不需要改代码）。
 
 ## 注意

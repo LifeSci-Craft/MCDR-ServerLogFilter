@@ -108,9 +108,6 @@ class Config(Serializable):
     小于 1 按 1 处理；大于 ``MAX_PROBE_BUDGET_MS`` 按上限处理，且会 warning 一次。
     """
 
-    announce_config_upgrade: bool = True
-    """插件升级后配置被自动补齐时，在控制台说明本次新增了哪些选项。"""
-
     announce_broken_config: bool = True
     """配置文件解析失败、被备份并重置时，在控制台说明原因与备份路径。"""
 
@@ -123,69 +120,6 @@ BROKEN_CONFIG_NOTICE_OPTION = "announce_broken_config"
 # 同上，语言选项也得能从「原文」里读：配置文件写坏时，唯一能得知用户想要哪种语言的
 # 地方就是他自己写的那段文本（马上就要被改名备份了）。
 LANGUAGE_OPTION = "language"
-
-
-# --------------------------------------------------------------------------
-#  配置项一览（用于升级提示）
-#
-#  这里只描述「每个选项是干什么的、哪个版本加的」，用于在插件更新后告诉管理员
-#  配置里多了什么。配置文件本身不写任何注释——JSON 没有注释语法，而在文件里塞
-#  自定义键会被 MCDR 当成「冗余键」在下一次保存时删掉（实测确认过），
-#  为此专门维护一份说明字段反而把配置弄复杂了。选项的完整说明在 README 里。
-#
-#  说明文字本身在语言文件里（键为 ``config_doc.<选项名>``），所以这里存的是键名
-#  而不是句子——这样两种语言不会各自漂移，也顺手让「每个选项都有说明」这条不变式
-#  对全部语言同时成立。
-# --------------------------------------------------------------------------
-
-# 配置项 -> (加入的版本, 语言文件里的说明键)
-CONFIG_DOC: Dict[str, Tuple[str, str]] = {
-    "language": (
-        "1.2.2",
-        "config_doc.language",
-    ),
-    "patterns": (
-        "1.0.0",
-        "config_doc.patterns",
-    ),
-    "log_matched_lines": (
-        "1.0.0",
-        "config_doc.log_matched_lines",
-    ),
-    "report_on_server_stop": (
-        "1.0.0",
-        "config_doc.report_on_server_stop",
-    ),
-    "warn_about_stale_rules": (
-        "1.1.0",
-        "config_doc.warn_about_stale_rules",
-    ),
-    "stale_rule_threshold": (
-        "1.1.0",
-        "config_doc.stale_rule_threshold",
-    ),
-    "validate_patterns": (
-        "1.1.0",
-        "config_doc.validate_patterns",
-    ),
-    "pattern_probe_timeout_ms": (
-        "1.1.0",
-        "config_doc.pattern_probe_timeout_ms",
-    ),
-    "announce_config_upgrade": (
-        "1.2.1",
-        "config_doc.announce_config_upgrade",
-    ),
-    "announce_broken_config": (
-        "1.2.1",
-        "config_doc.announce_broken_config",
-    ),
-}
-
-
-def _config_option_names() -> List[str]:
-    """按声明顺序列出用户配置项。"""
-    return list(Config.get_field_annotations())
 
 
 class RuleState(Serializable):
@@ -424,11 +358,22 @@ MIN_LONG_PROBE_BUDGET_MS = 1.0
 
 # 增长判据：对 n 与 2n 计时，比值超过它即视为指数级回溯。
 # 实测 `(a|aa)+$` 在 22+`!` → 44+`!` 上约 ×19（4.5 ms → 87 ms）；正常规则两组都是
-# 微秒级、低于 ``PROBE_GROWTH_FLOOR_MS`` 而直接跳过判断。比值对机器快慢不敏感，
+# 微秒级、低于 ``PROBE_GROWTH_NOISE_MS`` 而直接跳过判断。比值对机器快慢不敏感，
 # 比绝对耗时更稳，是这一层的**主**判据；预算判据是兜底。
 PROBE_GROWTH_RATIO = 8.0
-# 分母低于它时比值只是噪声，不做增长判断（正常规则就落在这里）。
+# 比值要成立，**两次**测量都得离开计时器噪声：
+#
+# * 大的一次要肉眼可见（``PROBE_GROWTH_FLOOR_MS``）；
+# * 小的一次只需要高于 ``PROBE_GROWTH_NOISE_MS``（约 2 万次 ``perf_counter`` 滴答，
+#   抖动远小于 8×），而不是原来那个 0.5 ms。
+#
+# 第二档从 0.5 ms 降到 20 µs 是一个真实缺陷的修法：`(a|aa)+$` 在 13 字符上只要
+# 39 µs（低于 0.5 ms），于是**比值判据被整条跳过**，只剩绝对预算兜底；而那条模式在
+# 25 字符上约 11 ms，在 25 ms 预算下照样通过。结果就是「P1 要拦的那条模式」在快机器
+# 上被放行、在慢机器（或 CI）上被拦下——同一份代码给出两种结论。分母只要离开噪声，
+# 288× 的比值本身就是可靠证据。
 PROBE_GROWTH_FLOOR_MS = 0.5
+PROBE_GROWTH_NOISE_MS = 0.02
 
 # ``pattern_probe_timeout_ms`` 的下限与上限。下限 1 ms 防止「预算 ≤0 把所有规则
 # 全判危险」；上限 2000 ms 防止把它写成一个巨大的值之后，``on_load``（以及
@@ -478,6 +423,7 @@ def _probe_pattern(regex: Pattern, budget_ms: int) -> Optional[Tuple[str, float,
     **这是启发式，不是形式化保证**：它拦不住所有病态正则，见 docs/DEVELOPMENT.md。
     """
     floor = PROBE_GROWTH_FLOOR_MS / 1000.0
+    noise = PROBE_GROWTH_NOISE_MS / 1000.0
     for pair in GROWTH_PROBE_PAIRS:
         costs: List[float] = []
         for subject in pair:
@@ -486,9 +432,12 @@ def _probe_pattern(regex: Pattern, budget_ms: int) -> Optional[Tuple[str, float,
             regex.search(subject)
             costs.append(time.perf_counter() - start)
         # 比值先行：它是**机器无关**的证据，而且能在一个字母表上就把 n 与 2n 的
-        # 差距看出来。分母低于噪声底时才退回预算判据（正常规则两档都是微秒级）。
-        if costs[0] > floor and costs[-1] / costs[0] > PROBE_GROWTH_RATIO:
-            return (PROBE_DETAIL_KEYS[1], costs[-1], int(budget_ms))
+        # 差距看出来。两次测量都要离开噪声才比较——分母的门槛是 **20 µs** 而不是
+        # 0.5 ms，否则「小规模还在微秒级、大规模已经是毫秒级」这类模式会被整条跳过
+        # （见 ``PROBE_GROWTH_NOISE_MS``）。剩下两档都只是微秒级的普通规则仍会跳过。
+        if costs[-1] > floor and costs[0] > noise:
+            if costs[-1] / costs[0] > PROBE_GROWTH_RATIO:
+                return (PROBE_DETAIL_KEYS[1], costs[-1], int(budget_ms))
         for subject, cost in zip(pair, costs):
             budget = _subject_budget_ms(subject, budget_ms) / 1000.0
             if cost > budget:
@@ -702,9 +651,6 @@ def _state_mutex() -> threading.Lock:
 # 只有完成过启动的周期才计入「零命中」统计，否则连续启动失败会刷出假提醒。
 _session_reached_startup = False
 
-# 由 _config_migrator 填、_announce_new_options 报：本次缺了哪些选项（= 新增的）。
-_newly_added_options: List[str] = []
-
 # 配置是否刚因写坏被重置过；是的话 patterns 是默认值而非用户配置，不能据此清理历史。
 _config_was_reset = False
 
@@ -852,59 +798,13 @@ def _save_state(server: PluginServerInterface, state: State) -> None:
     server.save_config_simple(state, file_name=STATE_FILE_NAME)
 
 
-def _config_migrator(read_data) -> bool:
-    """``load_config_simple(data_processor=...)`` 钩子：记下缺了哪些选项（即新增的）。
-
-    补写由 MCDR 自己完成，所以始终返回 False。
-    """
-    global _newly_added_options
-
-    if not isinstance(read_data, dict):
-        return False
-
-    present = set(read_data)
-    _newly_added_options = [
-        name for name in _config_option_names() if name not in present
-    ]
-    return False
-
-
-def _announce_new_options(server: PluginServerInterface) -> None:
-    """插件升级后，把新增了哪些配置项告诉管理员。"""
-    if not _newly_added_options:
-        return
-    lines = [
-        "",
-        "=" * 66,
-        _t("upgrade.title", count=len(_newly_added_options)),
-    ]
-    for name in _newly_added_options:
-        since, doc_key = CONFIG_DOC.get(name, ("?", None))
-        lines.append(_t("upgrade.entry", name=name, since=since))
-        description = (
-            _t(doc_key) if doc_key is not None else _t("upgrade.no_description")
-        )
-        lines.append(_t("upgrade.entry_desc", desc=description))
-    lines += [
-        _t("upgrade.config_path", folder=_CONFIG_FOLDER_DISPLAY),
-        _t("upgrade.readme_hint"),
-        "=" * 66,
-        "",
-    ]
-    server.logger.info("\n".join(lines))
-
-
 def _load_config(server: PluginServerInterface) -> Config:
-    """读取配置，并把语言**最早**定下来（后面的播报都要用它）。
+    """读取配置，并把语言**最早**定下来（后面的播报都要用它）。"""
+    global _config_was_reset, _language, _language_setting
 
-    开关只决定说不说：``announce_config_upgrade`` 关掉也照补配置。
-    """
-    global _newly_added_options, _config_was_reset, _language, _language_setting
-
-    _newly_added_options = []
     data = _read_bytes(os.path.join(server.get_data_folder(), CONFIG_FILE_NAME))
     _config_was_reset = _quarantine_broken_config(server, CONFIG_FILE_NAME, data) is not None
-    config = server.load_config_simple(target_class=Config, data_processor=_config_migrator)
+    config = server.load_config_simple(target_class=Config)
 
     setting = config.language
     if _config_was_reset:
@@ -915,9 +815,6 @@ def _load_config(server: PluginServerInterface) -> Config:
             setting = _raw_str_option(raw, LANGUAGE_OPTION) or setting
     _language_setting = setting
     _language = _resolve_language(server, setting)
-
-    if config.announce_config_upgrade:
-        _announce_new_options(server)
     return config
 
 

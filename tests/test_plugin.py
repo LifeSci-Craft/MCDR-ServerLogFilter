@@ -458,7 +458,6 @@ def test_config_defaults_match_documented_json():
     assert data["stale_rule_threshold"] == 3
     assert data["validate_patterns"] is True
     assert data["pattern_probe_timeout_ms"] == 25
-    assert data["announce_config_upgrade"] is True
     assert data["announce_broken_config"] is True
 
 
@@ -1637,29 +1636,6 @@ def config_options():
     return set(slf.Config.get_field_annotations())
 
 
-def test_every_config_option_has_a_description():
-    """Coverage invariant for the notes shown when a config gains new options.
-
-    Adding an option without recording its version would make the upgrade notice
-    announce a blank entry, so this fails until the option is described — in *every*
-    shipped language, since the sentence itself now comes from the catalogues.
-    """
-    documented = set(slf.CONFIG_DOC)
-    assert config_options() == documented, (
-        "undocumented options: {}; stale entries: {}".format(
-            config_options() - documented, documented - config_options()
-        )
-    )
-    for name, (since, doc_key) in slf.CONFIG_DOC.items():
-        assert re.match(r"^\d+\.\d+\.\d+$", since), "{}: bad version {!r}".format(name, since)
-        for language in i18n.available_languages():
-            text = i18n.translate(doc_key, language)
-            assert text != doc_key, "{}: no {} description for {}".format(
-                name, language, doc_key
-            )
-            assert text.strip(), "{}: empty description in {}".format(name, language)
-
-
 def test_the_generated_config_has_no_comment_fields():
     """The config must stay plain — no bookkeeping keys mixed in with user settings.
 
@@ -1669,128 +1645,6 @@ def test_the_generated_config_has_no_comment_fields():
     data = slf.Config().serialize()
     assert set(data) == config_options()
     assert not [k for k in data if k.startswith("#")]
-
-
-def test_migrator_reports_the_options_that_were_missing():
-    slf._newly_added_options = []
-    raw = {"patterns": ["x"]}                      # a 1.0.x era config
-    slf._config_migrator(raw)
-    assert slf._newly_added_options == [
-        "language", "log_matched_lines", "report_on_server_stop",
-        "warn_about_stale_rules", "stale_rule_threshold", "validate_patterns",
-        "pattern_probe_timeout_ms", "announce_config_upgrade", "announce_broken_config",
-    ]
-
-
-def test_migrator_says_nothing_when_the_config_is_complete():
-    slf._newly_added_options = ["stale"]
-    assert slf._config_migrator(slf.Config().serialize()) is False
-    assert slf._newly_added_options == []
-
-
-def test_migrator_never_asks_for_a_write():
-    """Filling in the missing options is MCDR's job; the hook only observes."""
-    slf._newly_added_options = []
-    assert slf._config_migrator({"patterns": ["x"]}) is False
-
-
-def test_migrator_tolerates_a_non_dict_config():
-    """A malformed file must not crash the loader before MCDR can regenerate it."""
-    assert slf._config_migrator(["not", "a", "dict"]) is False
-
-
-def test_on_load_wires_the_migrator_into_config_loading():
-    """Guard the wiring, not just the function — a correct function that is not
-    connected does nothing."""
-    server = FakePluginServer(config_data={"patterns": [LIVE]})
-    slf.on_load(server, None)
-    assert server.load_kwargs.get("data_processor") is slf._config_migrator
-
-
-def test_reload_command_also_migrates():
-    server = start_plugin(config={"patterns": [LIVE]})
-    server.load_kwargs = {}
-    server.config_data = {"patterns": [LIVE]}       # a stale, partial config appears
-    slf._apply_config(server)
-    assert server.load_kwargs.get("data_processor") is slf._config_migrator
-
-
-def announce_output(server):
-    return "\n".join(server.logger.infos)
-
-
-def test_upgrade_announcement_lists_options_with_versions():
-    server = FakePluginServer(config_data={"patterns": [LIVE]})
-    slf.on_load(server, None)
-    text = announce_output(server)
-    assert "配置已更新" in text
-    for name in ("warn_about_stale_rules", "stale_rule_threshold",
-                 "validate_patterns", "pattern_probe_timeout_ms"):
-        assert name in text
-    assert "v1.1.0 加入" in text
-
-
-def test_upgrade_announcement_explains_each_new_option():
-    """Naming the option is not enough — say what it does."""
-    server = FakePluginServer(config_data={"patterns": [LIVE]})
-    slf.on_load(server, None)
-    text = announce_output(server)
-    for name, (_, doc_key) in slf.CONFIG_DOC.items():
-        if name in ("patterns", "log_matched_lines", "report_on_server_stop"):
-            continue
-        # the sentence shown must be the catalogue's, in the language in force
-        expected = i18n.translate(doc_key, "zh_cn").split("。")[0]
-        assert expected in text, "{}: description missing".format(name)
-
-
-def test_no_announcement_when_the_config_is_already_current():
-    server = start_plugin(config=slf.Config().serialize())
-    server.logger.infos.clear()
-    slf.on_load(server, None)
-    assert "配置已更新" not in announce_output(server)
-
-
-def test_announcement_is_logged_exactly_once():
-    server = FakePluginServer(config_data={"patterns": [LIVE]})
-    slf.on_load(server, None)
-    assert announce_output(server).count("配置已更新") == 1
-
-
-def test_upgrade_announcement_can_be_switched_off():
-    """``announce_config_upgrade = false`` silences the notice — and nothing else.
-
-    The switch governs the *speaking*, not the filling-in: MCDR still writes the
-    missing options into the file (that part is not ours to gate), the admin just
-    stops being told about it at every load.
-    """
-    server = FakePluginServer(
-        config_data={"patterns": [LIVE], "announce_config_upgrade": False}
-    )
-    slf.on_load(server, None)
-
-    assert "配置已更新" not in announce_output(server)
-    # the config still got completed — only the announcement is gone
-    assert set(slf._config.serialize()) == config_options()
-    assert slf._newly_added_options, "the missing options were still detected"
-
-
-def test_the_upgrade_switch_defaults_to_on():
-    server = FakePluginServer(config_data={"patterns": [LIVE]})
-    slf.on_load(server, None)
-    assert slf._config.announce_config_upgrade is True
-
-
-def test_the_upgrade_switch_survives_a_reload():
-    """Reloading with the switch off must stay quiet the second time too."""
-    config = {"patterns": [LIVE], "announce_config_upgrade": False}
-    server = start_plugin(config=config)
-    server.logger.infos.clear()
-
-    server.config_data = dict(config, validate_patterns=False)
-    slf._apply_config(server)
-
-    assert "配置已更新" not in announce_output(server)
-    assert slf._newly_added_options, "the reload should still have found new options"
 
 
 # ---------------------------------------------------------------------------
@@ -2074,7 +1928,6 @@ def keys_referenced_in_the_code():
             first = node.args[0]
             if isinstance(first, ast.Constant) and isinstance(first.value, str):
                 keys.add(first.value)
-    keys |= {doc_key for _, doc_key in slf.CONFIG_DOC.values()}
     # Never a literal at a call site: i18n.resolve() hands it back as a note key.
     keys.add(i18n.UNSUPPORTED_KEY)
     # ``_probe_pattern`` returns a key *name* rather than a sentence and the caller
@@ -2091,11 +1944,20 @@ def test_the_language_option_is_a_real_option_defaulting_to_auto():
     assert slf.LANGUAGE_OPTION in config_options()
 
 
+def log_output(server):
+    """Everything the plugin logged at INFO level, as one string.
+
+    The language tests read the messages the plugin prints while loading; it used to be named
+    after the upgrade notice, which no longer exists.
+    """
+    return "\n".join(server.logger.infos)
+
+
 def test_auto_follows_mcdr():
     """The documented default: MCDR says en_us, so the plugin does too."""
     server = start_plugin(config={"patterns": [LIVE]}, mcdr_language="en_us")
     assert slf._language == "en_us"
-    assert "Enabled 1 log filter rule" in announce_output(server)
+    assert "Enabled 1 log filter rule" in log_output(server)
     assert server.help_messages == [
         ("!!logfilter", i18n.translate("help.logfilter", "en_us")),
         ("!!lf", i18n.translate("help.logfilter", "en_us")),
@@ -2107,7 +1969,7 @@ def test_auto_follows_mcdr_in_the_other_direction():
     otherwise make ``auto`` look like it works while ignoring MCDR entirely."""
     server = start_plugin(config={"patterns": [LIVE]}, mcdr_language="zh_cn")
     assert slf._language == "zh_cn"
-    assert "已启用 1 条日志过滤规则" in announce_output(server)
+    assert "已启用 1 条日志过滤规则" in log_output(server)
 
 
 def test_auto_is_silent_about_an_mcdr_language_we_do_not_ship():
@@ -2126,7 +1988,7 @@ def test_an_explicit_language_overrides_mcdr():
         config={"patterns": [LIVE], "language": "zh_cn"}, mcdr_language="en_us"
     )
     assert slf._language == "zh_cn"
-    assert "已启用 1 条日志过滤规则" in announce_output(server)
+    assert "已启用 1 条日志过滤规则" in log_output(server)
 
 
 @pytest.mark.parametrize(
@@ -2193,7 +2055,7 @@ def test_a_broken_catalogue_falls_back_and_is_reported(monkeypatch):
         warnings = "\n".join(server.logger.warnings)
         assert "zh_cn.json" in warnings, warnings
         # messages fall back to the catalogue that does load, rather than showing keys
-        assert "Enabled 1 log filter rule" in announce_output(server)
+        assert "Enabled 1 log filter rule" in log_output(server)
     finally:
         i18n.clear_cache()
 
@@ -2208,7 +2070,7 @@ def test_two_broken_catalogues_still_do_not_break_the_plugin(monkeypatch):
     try:
         server = start_plugin(config={"patterns": [LIVE], "language": "zh_cn"})
         assert slf._log_filter is not None, "the plugin still loaded"
-        assert "summary.rules_enabled" in announce_output(server)
+        assert "summary.rules_enabled" in log_output(server)
     finally:
         i18n.clear_cache()
 
@@ -2368,16 +2230,22 @@ def test_english_reaches_the_prune_announcement_and_the_rule_errors():
     ), danger.logger.errors
 
 
-def test_english_reaches_the_upgrade_notice():
-    server = FakePluginServer(
-        config_data={"patterns": [LIVE], "language": "en_us"}, mcdr_language="en_us"
-    )
+def test_english_reaches_the_broken_config_notice(tmp_path):
+    """The notices are part of the interface, so they have to arrive translated.
+
+    This used to check the upgrade notice, which no longer exists. The same claim is made
+    against the one notice the plugin still prints by itself while loading.
+    """
+    folder = tmp_path / "cfg"
+    folder.mkdir()
+    (folder / "config.json").write_text(BROKEN_JSON, encoding="utf-8")
+    server = FakePluginServer(data_folder=str(folder), mcdr_language="en_us")
+
     slf.on_load(server, None)
 
-    text = announce_output(server)
-    assert "Config updated" in text
-    assert "added in v1.1.0" in text
-    assert 'See the "Configuration" section' in text
+    text = "\n".join(server.logger.errors)
+    assert "The config file cannot be parsed" in text, text
+    assert "Your original file was saved as" in text, text
 
 
 # --- catalogue invariants ---------------------------------------------------
@@ -2425,12 +2293,6 @@ def test_no_catalogue_key_is_left_unused():
     """Dead keys ship to every user and quietly stop being maintained."""
     unused = sorted(set(catalogue("en_us")) - keys_referenced_in_the_code())
     assert not unused, "unused catalogue keys: {}".format(unused)
-
-
-def test_the_config_descriptions_are_exactly_the_options():
-    described = {k for k in catalogue("en_us") if k.startswith("config_doc.")}
-    expected = {"config_doc." + name for name in config_options()}
-    assert described == expected, sorted(described ^ expected)
 
 
 def test_the_english_catalogue_is_actually_english():
@@ -3207,6 +3069,53 @@ def test_the_probe_bounds_its_own_worst_case():
     assert max(slf.GROWTH_PROBE_LENGTHS) <= 32, (
         "增长档太长会让指数级模式自己把探测卡住：{}".format(slf.GROWTH_PROBE_LENGTHS)
     )
+
+
+class _ScriptedClock:
+    """A ``time`` stand-in whose ``perf_counter()`` walks a fixed list of readings.
+
+    The growth judgement is a timing rule, so a test that measures real time either depends on
+    the machine or flakes on it. Feeding the readings the machine actually produced (39 µs and
+    11 ms for `(a|aa)+$`) makes the *decision* under test — not the CPU — the thing being pinned.
+
+    With no readings given it advances by ``step`` on every call, which is what the noise case
+    needs: every search then looks like a microsecond, for as many calls as the probe makes.
+    """
+
+    def __init__(self, readings=None, step=0.000001):
+        self._readings = None if readings is None else list(readings)
+        self._step = step
+        self._now = 0.0
+
+    def perf_counter(self):
+        if self._readings is not None:
+            return self._readings.pop(0)
+        self._now += self._step
+        return self._now
+
+
+def test_the_growth_rule_uses_a_microsecond_denominator(monkeypatch):
+    """A 290× ratio counts even when the small measurement is only microseconds.
+
+    This is the regression for a real slip: requiring the *denominator* to clear 0.5 ms meant
+    `(a|aa)+$` (39 µs at 13 characters, 11 ms at 25) skipped the ratio entirely and fell through
+    to the 25 ms absolute budget — so the very pattern the guard exists for was refused on a slow
+    runner and accepted on a fast one. The readings below are that pattern's real ones.
+    """
+    monkeypatch.setattr(slf, "time", _ScriptedClock([0.0, 0.000039, 1.0, 1.011]))
+    verdict = slf._probe_pattern(re.compile(r"(a|aa)+$"), 25)
+    assert verdict is not None, "a 290x growth ratio must be enough on its own"
+    assert verdict[0] == slf.PROBE_DETAIL_KEYS[1], verdict
+
+
+def test_the_growth_rule_stays_quiet_when_both_readings_are_noise(monkeypatch):
+    """A ratio computed entirely inside the timer noise is not evidence.
+
+    Every search looks like a microsecond here — the scale ordinary rules live at — so the probe
+    must reach its "nothing wrong" verdict instead of calling the jitter growth.
+    """
+    monkeypatch.setattr(slf, "time", _ScriptedClock())
+    assert slf._probe_pattern(re.compile(r"standing on air"), 25) is None
 
 
 @pytest.mark.parametrize(
