@@ -32,7 +32,7 @@ import time
 import zipfile
 
 import pytest
-from mcdreforged.api.types import PermissionLevel
+from mcdreforged.api.types import InfoActionFlag, PermissionLevel
 
 import server_log_filter as slf
 from server_log_filter import i18n
@@ -120,10 +120,14 @@ def make_filter(patterns=None, log_matched=False):
 class FakeInfo:
     """Minimal stand-in for mcdreforged Info (pure-logic layer)."""
 
-    def __init__(self, content, raw_content=None):
+    def __init__(self, content, raw_content=None, action_flag=None, is_from_console=False):
         self.content = content
         self.raw_content = raw_content if raw_content is not None else content
-        self.action_flag = "UNTOUCHED"
+        # 真实的 Info 一出生就带全套标志（send_to_server|echo_to_console|process）。
+        # 插件现在只**按位清掉** echo（SLF-A-03），所以这里不能再用 `"UNTOUCHED"` 这种
+        # 哨兵值：`&=` 会直接抛 TypeError，而且哨兵值也证明不了「别的位没被动过」。
+        self.action_flag = InfoActionFlag.default() if action_flag is None else action_flag
+        self.is_from_console = is_from_console
 
 
 class FakeSource:
@@ -282,24 +286,50 @@ def test_near_miss_lines_do_not_match():
 
 def test_hidden_line_keeps_process_flag():
     """THE safety property: hidden, not discarded."""
-    try:
-        from mcdreforged.api.types import InfoActionFlag
-    except ImportError:
-        pytest.skip("mcdreforged not installed")
     f = make_filter()
     info = FakeInfo("Player Steve standing on air - force-sending blocks below")
     f.filter_server_info(info)
-    assert info.action_flag is InfoActionFlag.hidden()
+    assert info.action_flag == InfoActionFlag.hidden()
     assert InfoActionFlag.process in info.action_flag, "events must keep flowing"
     assert InfoActionFlag.echo_to_console not in info.action_flag, "console must be clean"
     assert info.action_flag != InfoActionFlag.discarded(), "must never discard the info"
+
+
+def test_a_hit_only_clears_the_echo_bit_and_leaves_other_filters_alone():
+    """SLF-A-03：命中只能清 echo，不能整体赋值。
+
+    MCDR 的 ``put_info`` 按注册顺序把**所有** filter 跑一遍：返回 False 的那个已经把
+    ``action_flag`` 置成 ``discarded()``，别的插件也可能 ``cancel_send_to_server()``。
+    整体赋值成 ``hidden()``（= send_to_server|process）会把它们抹回来——被丢弃的行又
+    开始派发事件，被拦下的命令照发。
+    """
+    f = make_filter()
+
+    discarded = FakeInfo("Player Steve standing on air - force-sending blocks below")
+    discarded.action_flag = InfoActionFlag.discarded()
+    f.filter_server_info(discarded)
+    assert discarded.action_flag == InfoActionFlag.discarded(), (
+        "别人刚丢弃的行走又被加回了位"
+    )
+
+    cancelled = FakeInfo("Player Steve standing on air - force-sending blocks below")
+    # 「另一个插件取消了发给服务端」：等价于 default() 去掉 send_to_server 那一位。
+    # 刻意不写 ``~InfoActionFlag.send_to_server``：``enum.Flag.__invert__`` 在 3.9 上
+    # 不保证存在，而 unit 的 3.9 leg 也会跑这个文件。
+    cancelled.action_flag = InfoActionFlag.echo_to_console | InfoActionFlag.process
+    f.filter_server_info(cancelled)
+    assert InfoActionFlag.send_to_server not in cancelled.action_flag, (
+        "别人取消的「发给服务端」被本插件加回来了"
+    )
+    assert InfoActionFlag.echo_to_console not in cancelled.action_flag
+    assert InfoActionFlag.process in cancelled.action_flag, "事件分发不受影响"
 
 
 def test_unmatched_line_is_left_untouched():
     f = make_filter()
     info = FakeInfo('Done (0.648s)! For help, type "help"')
     f.filter_server_info(info)
-    assert info.action_flag == "UNTOUCHED", "filter must not mutate unrelated info"
+    assert info.action_flag == InfoActionFlag.default(), "filter must not mutate unrelated info"
 
 
 @pytest.mark.parametrize("content", ["", None, "   ", "\t", "\n"])
@@ -313,7 +343,7 @@ def test_falls_back_to_raw_content_when_content_is_none():
     f = make_filter()
     info = FakeInfo(None, raw_content="Player Steve standing on air - force-sending blocks below")
     f.filter_server_info(info)
-    assert info.action_flag != "UNTOUCHED"
+    assert info.action_flag != InfoActionFlag.default()
 
 
 def test_player_name_variation_all_match():
@@ -370,7 +400,11 @@ def test_unmatched_lines_do_not_increment_counters():
 
 
 def test_reload_swaps_the_rules_and_drops_removed_ones():
-    """规则被换掉后：删掉的规则计数归零，留下的规则接着数（见下面那两条）。"""
+    """规则被换掉后：删掉的规则计数归零，留下的规则接着数（见下面那两条）。
+
+    ``total`` 是**已隐去的行数**（SLF-A-04），所以它不按「还在配置里的规则」重算：
+    那一行确实已经被隐去了，删掉规则不该让「本次已隐去」少一行。
+    """
     f = make_filter(["alpha"])
     f.filter_server_info(FakeInfo("alpha"))
     assert f.total == 1
@@ -378,7 +412,8 @@ def test_reload_swaps_the_rules_and_drops_removed_ones():
     f.reload_rules([slf.Rule("gamma")], False)
 
     assert f.rules[0].pattern == "gamma"
-    assert f.total == 0, "被删掉的规则不该把它的计数留给别人"
+    assert f.total == 1, "已经隐去过的那一行不因为规则被删掉就消失"
+    assert f.rules[0].count == 0, "被删掉的规则的命中数不该留给别人"
     assert f.match("alpha") is None
     assert f.match("gamma") is not None
 
@@ -417,7 +452,27 @@ def test_every_matching_rule_is_counted_not_just_the_first():
 
     assert f.rules[0].count == 1
     assert f.rules[1].count == 1, "被第一条遮蔽的规则也在工作，必须一起计数"
-    assert f.total == 2, "两处计数各自加一（total 记的是命中次数，不是被隐去的行数）"
+    # SLF-A-04：``total`` 是**行数**而不是各规则计数之和——这一行只被隐去了一次，
+    # 状态页与关服汇报印的就是它。
+    assert f.total == 1, "一行命中两条规则仍然只隐去一行"
+
+
+def test_console_input_is_not_counted_as_a_hidden_server_log_line():
+    """SLF-A-04：控制台输入不该混进「已隐去多少行**服务端日志**」。
+
+    MCDR 的 ``echo_to_console`` 只对服务端输出生效（``info_reactor_manager.put_info``
+    里那个 ``if info.is_from_server``），所以管理员敲的一行并没有被「隐去」，
+    把它算进去就是多报。各规则的命中数照旧记（它确实命中了）。
+    """
+    f = make_filter(["stop"])
+    typed = FakeInfo("stop", is_from_console=True)
+    f.filter_server_info(typed)
+
+    assert f.rules[0].count == 1, "规则命中数照旧"
+    assert f.total == 0, "控制台输入不算已隐去的服务端日志行"
+
+    f.filter_server_info(FakeInfo("stop"))
+    assert f.total == 1, "同一条规则处理服务端输出时才计入行数"
 
 
 def test_a_rule_that_really_does_not_match_still_stays_at_zero():
@@ -733,11 +788,22 @@ def test_min_mcdr_version_matches_plugin_metadata():
 
 
 def test_plugin_metadata_matches_repo_conventions():
+    """元数据只写「五个已装 MCDR 版本都认」的那一套（REPO-18）。
+
+    实测：2.13.0–2.15.7 的解析器只有 legacy 的 ``author`` / ``link``（``authors`` /
+    ``links`` 要到 2.16.0 的 schema 才出现），而 2.16.0 会把两者**合并**——同时写上
+    ``author`` 与 ``authors`` 会得到两个同名作者。所以这里是「legacy 作者 + legacy 主页 +
+    现代 ``links``（2.16 在有 ``links.homepage`` 时忽略 ``link``，不会重复）+ ``license``
+    （只有 2.16 认，旧版本忽略多余键）」。
+    """
     meta = json.loads((pathlib.Path(__file__).resolve().parent.parent / "mcdreforged.plugin.json").read_text("utf-8"))
     assert meta["id"] == "server_log_filter"
     assert meta["license"] == "MIT"
     assert set(meta["description"]) == {"en_us", "zh_cn"}
-    assert meta["authors"][0]["name"] == "Pau1am"
+    assert meta["author"] == ["Pau1am"]
+    assert "authors" not in meta, "两套作者写法同时存在会让 MCDR 2.16 合并出两个同名作者"
+    assert meta["link"] == "https://github.com/LifeSci-Craft/MCDR-ServerLogFilter"
+    assert meta["links"]["homepage"] == meta["link"]
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +995,48 @@ def test_the_matrix_tool_hands_mcdr_an_absolute_testlibs_path(monkeypatch):
 
     monkeypatch.setattr(tool, "_interpreter_has_own_mcdr", lambda _python: True)
     assert "PYTHONPATH" not in tool.child_env("python")
+
+
+def _load_matrix_tool():
+    """把 ``tools/mcdr_matrix.py`` 当模块加载进来（它不是包的一部分）。"""
+    import importlib.util
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "slf_matrix_tool", root / "tools" / "mcdr_matrix.py"
+    )
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+def test_the_matrix_tool_pins_the_child_output_encoding(monkeypatch):
+    """SLF-A-06：矩阵必须给子进程设 ``PYTHONIOENCODING``。
+
+    父进程按 UTF-8 解码子进程的 stdout，而中文 Windows（cp936）上 MCDR 按 GBK 写管道：
+    所有中文——连 MCDR 自己的——都变成替代字符，于是 ``loaded`` / ``warning_shown`` /
+    ``spoke_chinese`` 在**每个**版本上都为假，三个版本一起 FAIL；而同一份输出里
+    「目标行确实被隐去、state.json 确实推进了一轮」都是真的，说明插件完全正常。
+    发版门禁（README 与 docs 都写着「矩阵不通过就不发版」）就此变成噪音。
+    """
+    tool = _load_matrix_tool()
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.setattr(tool, "_interpreter_has_own_mcdr", lambda _python: True)
+    assert tool.child_env("python")["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_the_matrix_tool_writes_lf_files_without_a_310_keyword(tmp_path):
+    """SLF-A-11：工具自己声明支持 3.9，就不能用 3.10 才有的 ``newline=`` 形参。
+
+    ``Path.write_text(..., newline="\\n")`` 在 3.9 上是 ``TypeError``，而文档正是让人把
+    MCDR 2.15.0 自带的那套 3.9 解释器传进来跑它。同时钉住「写出来的是 LF」这一条：
+    只把那个形参删掉还不够——``write_text(text, encoding="utf-8")`` 在 Windows 上会把
+    ``\\n`` 翻成 ``\\r\\n``。
+    """
+    tool = _load_matrix_tool()
+    target = tmp_path / "nested" / "file.txt"
+    tool.write(target, "a\r\nb\rc\nd\n")
+    assert target.read_bytes() == b"a\nb\nc\nd\n", "必须自己归一成 LF"
 
 
 def test_packager_root_entries_would_be_illegal_if_denylisted():
@@ -1536,15 +1644,30 @@ def test_rule_pattern_is_stripped_and_blank_ones_skipped():
 # ---------------------------------------------------------------------------
 
 
-def test_hidden_flag_is_built_once_and_reused():
-    """InfoActionFlag.hidden() allocates a new flag; the hot path must not call it."""
-    f = make_filter()
-    assert f._hidden_flag is not None
-    assert f._hidden_flag is f._hidden_flag
+def test_the_hide_mask_is_built_once_and_reused(monkeypatch):
+    """命中路径不能再调用 ``InfoActionFlag.hidden()`` / ``default()``（它们每次都新建对象）。
 
-    info = FakeInfo("Player Steve standing on air - force-sending blocks below")
-    f.filter_server_info(info)
-    assert info.action_flag is f._hidden_flag, "each hit must reuse the cached flag"
+    SLF-A-03 之后命中路径做的是 ``action_flag &= self._hide_mask``：掩码在构造时算一次，
+    之后只是位运算，一个分配都没有。
+    """
+    f = make_filter()
+    assert f._hide_mask is not None
+    assert f._hide_mask == InfoActionFlag.hidden(), "掩码就是「echo 之外的全部位」"
+
+    def boom(*args, **kwargs):
+        raise AssertionError("命中路径不得再新建标志")
+
+    # Info 要在打桩**之前**造好：真实的 Info 一出生就会调 ``default()``。
+    infos = [
+        FakeInfo("Player Steve standing on air - force-sending blocks below")
+        for _ in range(3)
+    ]
+    monkeypatch.setattr(InfoActionFlag, "hidden", boom)
+    monkeypatch.setattr(InfoActionFlag, "default", boom)
+
+    for info in infos:
+        f.filter_server_info(info)
+        assert info.action_flag == f._hide_mask
 
 
 def test_rules_are_stored_immutably():
@@ -1581,7 +1704,7 @@ def test_non_matching_line_leaves_the_action_flag_alone():
     f = make_filter()
     info = FakeInfo("Steve joined the game")
     f.filter_server_info(info)
-    assert info.action_flag == "UNTOUCHED"
+    assert info.action_flag == InfoActionFlag.default()
 
 
 def test_matching_no_longer_short_circuits_but_still_reports_order():
@@ -2837,7 +2960,9 @@ def test_the_reload_command_still_forgets_a_deleted_rules_counts():
 
     assert [r.pattern for r in slf._log_filter.rules] == ["kept"]
     assert slf._log_filter.rules[0].count == 1, "留下的规则要接着数"
-    assert slf._log_filter.total == 1, "被删掉的规则不该把计数留下来"
+    # 4 行确实被隐去过（gone 3 行 + kept 1 行）；``total`` 记的是行数，删规则不改写历史
+    # （SLF-A-04）——被删掉的只是那条规则的计数。
+    assert slf._log_filter.total == 4, "已隐去的行数不因规则被删掉而改写"
 
 
 def test_the_test_command_lists_every_matching_rule():
@@ -4055,19 +4180,21 @@ def test_the_catch_all_subject_set_still_has_no_empty_string():
     assert slf._matches_everything(re.compile(".+"))
 
 
-def test_the_reload_command_replies_instead_of_raising():
-    """SLF-15①：``!!reload`` 没有异常兜底（同一个文件的 ``reset`` 有）。"""
+def test_the_reload_command_replies_instead_of_raising(monkeypatch):
+    """SLF-15①：``!!reload`` 没有异常兜底（同一个文件的 ``reset`` 有）。
+
+    ``_apply_config`` 交给 monkeypatch 打桩（而不是赋值后 ``del``）：``del`` 会把模块级
+    的那个函数整个删掉，排在后面的用例再调 ``!!lf reload`` 就只会得到一条
+    ``NameError: name '_apply_config' is not defined``。
+    """
     server = start_plugin(config={"patterns": [LIVE]})
 
     def boom(_server):
         raise RuntimeError("simulated reload failure")
 
-    slf._apply_config = boom
+    monkeypatch.setattr(slf, "_apply_config", boom)
     source = FakeSource()
-    try:
-        slf._reload(source)                     # 不允许抛出去
-    finally:
-        del slf._apply_config
+    slf._reload(source)                     # 不允许抛出去
 
     text = "".join(str(x) for x in source.replies)
     assert text, "管理员必须得到一条回复，而不是只有一条 traceback"
@@ -4160,6 +4287,264 @@ def test_a_command_run_before_on_load_replies_and_does_not_raise():
             assert "尚未初始化" in "".join(str(x) for x in source.replies)
     finally:
         slf._server, slf._state, slf._log_filter = saved
+
+
+# ---------------------------------------------------------------------------
+#  24. 正文的取值路径（SLF-A-02）与空正文（SLF-A-07）
+# ---------------------------------------------------------------------------
+
+
+def _vanilla_info(raw_line):
+    """把一行控制台原文交给 MCDR **自己的** vanilla handler，取回真实过滤看到的 Info。
+
+    这是本节最重要的基准：过滤器匹配的是 MCDR 解析后的 ``info.content``，不是管理员
+    粘贴的整行。所以「``!!lf test`` 回答得对不对」只能拿它比对，不能两边各写一份
+    剥离逻辑再互相比。
+    """
+    from mcdreforged.handler.impl.vanilla_handler import VanillaHandler
+
+    return VanillaHandler().parse_server_stdout(raw_line)
+
+
+# 三种来源各一行，外加两种「玩家名前缀」形态：
+# * ``<Steve> hello there`` 与 ``[Not Secure] <Steve> hello there`` 是玩家发言，
+#   MCDR 除控制台前缀之外**还会**剥掉 ``<Steve> ``，正文是 ``hello there``；
+# * ``Steve hello there`` **不是**玩家发言（vanilla handler 只认尖括号那种写法），
+#   正文原样保留——这条用来钉住「别多剥一刀」。
+# * 最后一行是「前缀 + 空正文」，MCDR 给出的 content 是空串（SLF-A-07）。
+CONSOLE_SAMPLES = [
+    '[12:00:00] [Server thread/INFO]: Player Steve standing on air - force-sending blocks below',
+    '[12:00:00] [Server thread/INFO]: <Steve> hello there',
+    '[12:00:00] [Server thread/INFO]: [Not Secure] <Steve> hello there',
+    '[12:00:00] [Server thread/INFO]: Steve hello there',
+    '[12:00:00] [Server thread/INFO]: ',
+]
+
+SAMPLE_PATTERNS = [
+    r"^hello",
+    r"^<Steve>",
+    r"^Player Steve",
+    r"^\[Not Secure\]",
+    r"hello there$",
+    r"^Steve hello",
+    r"^$",
+    LIVE,
+]
+
+
+@pytest.mark.parametrize("pattern", SAMPLE_PATTERNS)
+@pytest.mark.parametrize("raw_line", CONSOLE_SAMPLES)
+def test_the_test_command_agrees_with_the_real_filter(pattern, raw_line):
+    """SLF-A-02：同一条规则在 ``!!lf test`` 与真实过滤上必须给出**同一个**结论。
+
+    真实那一侧由 MCDR 自己的 vanilla handler 解析（真机上跑的就是这个函数），
+    ``test`` 那一侧拿同一行原文走命令入口。只要有一个说命中、另一个说不命中，
+    管理员就会去改一条本来就写对的规则（或者相反：以为一条永不命中的规则在保护他）。
+    """
+    start_plugin(config={"patterns": [pattern]})
+
+    info = _vanilla_info(raw_line)
+    before = info.action_flag
+    slf._log_filter.filter_server_info(info)
+    real_hidden = info.action_flag != before
+
+    source = FakeSource()
+    slf._test_line(source, {"text": raw_line})
+    reply = "".join(str(x) for x in source.replies)
+
+    detail = "模式 {!r}，原文 {!r}，MCDR 给出的正文 {!r}，回复 {!r}".format(
+        pattern, raw_line, info.content, reply
+    )
+    if real_hidden:
+        assert "命中规则" in reply, "真实过滤命中了，test 却说没命中：" + detail
+    else:
+        assert "不匹配" in reply, "真实过滤没命中，test 却说命中了：" + detail
+
+
+def test_the_test_command_agrees_with_the_real_filter_on_console_input():
+    """控制台输入这一来源：走 ``parse_console_command``，正文就是敲进去的整行。
+
+    它没有控制台前缀可剥，所以两边都必须原样匹配（SLF-A-02 要求的第二种来源）。
+    """
+    from mcdreforged.handler.impl.vanilla_handler import VanillaHandler
+
+    start_plugin(config={"patterns": [r"^stop$"]})
+
+    info = VanillaHandler().parse_console_command("stop")
+    assert info.is_from_console, "前置条件：这确实是控制台输入"
+    before = info.action_flag
+    slf._log_filter.filter_server_info(info)
+    assert info.action_flag != before, "真实过滤会隐去管理员敲的这一行"
+
+    source = FakeSource()
+    slf._test_line(source, {"text": "stop"})
+    assert "命中规则" in "".join(str(x) for x in source.replies)
+
+
+def test_a_blank_body_line_is_really_matched_not_only_promised_by_test():
+    """SLF-A-07：``^$`` 这类规则必须真的生效，而不是只被 ``!!lf test`` 承诺。
+
+    MCDR 对「``[时间] [线程/级别]: `` + 空正文」解析出的 ``content`` 恰是空串。旧写法
+    ``if not content: return`` 把空串一并挡在门外：这条规则在真实过滤里一次也不命中
+    （``count`` 永远是 0，还会被零命中告警点名），插件却为它发「匹配一切，请检查」的
+    告警、``!!lf test`` 也回答「会被隐去」——三处说法互相矛盾，管理员无从判断它无效。
+    """
+    start_plugin(config={"patterns": [r"^$"]})
+
+    info = _vanilla_info("[12:00:00] [Server thread/INFO]: ")
+    assert info.content == "", "前置条件：MCDR 对前缀 + 空正文给出的正文就是空串"
+
+    before = info.action_flag
+    slf._log_filter.filter_server_info(info)
+
+    assert info.action_flag != before, "空正文行也要真的被隐去"
+    assert slf._log_filter.rules[0].count == 1, "规则命中数要跟着动"
+    assert slf._log_filter.total == 1, "已隐去的行数也要跟着动"
+
+
+# ---------------------------------------------------------------------------
+#  25. 锁、谎报与死代码（SLF-A-01 / A-05 / A-08 / A-10 / A-12）
+# ---------------------------------------------------------------------------
+
+
+def test_the_stale_check_reads_the_rule_counts_through_the_filter_lock():
+    """SLF-A-01：``on_server_startup`` 必须在**过滤器的锁**里读规则命中数。
+
+    探针规则把 ``count`` 变成一个属性，在**被读的那一刻**记下 ``_log_filter._lock``
+    有没有被持有。命中数由 MCDR 主线程写，而 ``on_server_startup`` 跑在 task executor
+    线程上；裸读会在某一刻读到 0，于是刚命中过的规则被弹「连续 N 轮零命中，建议删除」。
+    """
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    real_rules = slf._log_filter.rules
+    reads = []
+
+    class ProbeRule:
+        pattern = IDLE
+        regex = real_rules[0].regex
+
+        @property
+        def count(self):
+            reads.append(slf._log_filter._lock.locked())
+            return 1
+
+    slf._log_filter._rules = (ProbeRule(),)
+    try:
+        slf.on_server_startup(server)
+    finally:
+        slf._log_filter._rules = real_rules
+
+    assert reads, "前置条件：这一轮确实读了命中数"
+    assert all(reads), "读规则命中数时过滤器锁没被持有（SLF-A-01）：{}".format(reads)
+
+
+def test_reset_reports_a_save_failure_instead_of_claiming_success(monkeypatch):
+    """SLF-A-05：``_save_state`` 失败时不许回绿字「已重置」。
+
+    内存里的 ``zero_streak`` 确实清零了（本轮不再告警），但没有落盘——重启或重载后旧
+    计数会回来。回复必须说清「哪一半成功、哪一半失败」，并把原因一起给出来。
+    """
+    server = start_plugin(config={"patterns": [IDLE], "stale_rule_threshold": 1})
+    run_session(server)
+    assert slf._state.rules[IDLE].zero_streak == 1
+
+    def boom(*args, **kwargs):
+        raise OSError("state.json is read-only")
+
+    monkeypatch.setattr(slf, "_save_state", boom)
+
+    source = FakeSource()
+    slf._reset_streaks(source)
+    text = "".join(str(x) for x in source.replies)
+
+    assert "已重置" not in text, "不许谎报成功: {}".format(text)
+    assert "state.json is read-only" in text, text
+    assert slf._state.rules[IDLE].zero_streak == 0, "内存里的确清零了，回复要如实说明这一半"
+    assert any("state.json is read-only" in m for m in server.logger.exceptions)
+
+
+def test_reload_says_the_rules_are_in_force_when_only_the_prune_fails(monkeypatch):
+    """SLF-A-08：规则已经换好之后再失败，不能回「规则保持原样」。
+
+    ``_apply_config`` 的顺序是「读配置 → 编译 → 换规则 → 清理统计」，只有最后一步会
+    在这里失败。回复若说「没生效」，管理员会去重复 reload / 重启、排查一个并不存在的
+    问题，而新规则其实已经在过滤线上跑了。
+    """
+    server = start_plugin(config={"patterns": ["kept", "gone"]})
+    slf.on_server_startup(server)
+    slf._log_filter.filter_server_info(FakeInfo("gone"))
+    server.config_data = {"patterns": ["kept"]}      # 管理员把 gone 删了 -> 会触发清理
+
+    def boom(*args, **kwargs):
+        raise OSError("state.json is read-only")
+
+    monkeypatch.setattr(slf, "_prune_state", boom)
+
+    source = FakeSource()
+    slf._reload(source)
+    text = "".join(str(x) for x in source.replies)
+
+    assert "重载失败" not in text, "规则已经生效，不能说成没生效: {}".format(text)
+    assert "state.json is read-only" in text, text
+    assert "已生效" in text, text
+    assert [r.pattern for r in slf._log_filter.rules] == ["kept"], "新规则确实已经生效"
+
+
+def test_the_status_screen_reads_the_state_under_its_lock():
+    """SLF-A-10：状态页读 ``_state`` 也走 ``_state_mutex()``（读侧同一把锁）。
+
+    做法：把 ``_state`` 换成一个「每次读都记下锁有没有被持有」的代理。旧实现在渲染
+    规则行时才去 ``_state.rules.get(...)``，那几次读都是免锁的。
+    """
+    start_plugin(config={"patterns": [LIVE, IDLE]})
+    real_state = slf._state
+    real_state.session_index = 3
+    real_state.rules[IDLE] = slf.RuleState(zero_streak=2, last_hit_session=1)
+    lock = slf._state_mutex()
+    reads = []
+
+    class ProbeState:
+        @property
+        def rules(self):
+            reads.append(lock.locked())
+            return real_state.rules
+
+        @property
+        def session_index(self):
+            reads.append(lock.locked())
+            return real_state.session_index
+
+    slf._state = ProbeState()
+    try:
+        slf._show_status(FakeSource())
+    finally:
+        slf._state = real_state
+
+    assert reads, "前置条件：状态页确实读了 _state"
+    assert all(reads), "状态页有免锁读（SLF-A-10）：{}".format(reads)
+
+
+def test_the_listing_failure_is_recorded_even_without_a_plugin_context(monkeypatch):
+    """SLF-A-12：没有活动 contextvar 时诊断也必须记进调用方给的 ``notes``。
+
+    ``record()`` 以前只在 ``_note`` **抛异常**时才写 ``notes``，而 ``_note`` 从不抛
+    （没有上下文就丢弃）——那个兜底分支不可达，单独 import 本模块的调试脚本拿到的是
+    沉默。现在按 ``_note`` 的返回值判断。
+    """
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("loader exploded")
+
+    monkeypatch.setattr(i18n.importlib.resources, "files", boom)
+    monkeypatch.setattr(i18n, "_filesystem_dir", lambda: str(REPO / "no-such-folder"))
+    notes = {}
+    token = slf._notes.set(None)          # 显式模拟「插件之外」：没有活动上下文
+    try:
+        i18n.available_languages(notes)
+    finally:
+        slf._notes.reset(token)
+
+    assert notes, "没有上下文时也必须留下诊断，而不是沉默"
+    assert any("loader exploded" in note for note in notes.values()), notes
 
 
 

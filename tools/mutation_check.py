@@ -38,11 +38,15 @@ WARN_BLOCK = """    if (
     ):
         return
 
-    # 持 _state 锁读一份规则计数快照：_collect_stale 的判据里有 rule.count（SLF-02），
-    # 而计数由主线程写，读的时候要和其他统计路径一个口径（SLF-10）。
+    # 规则元组与计数快照都取好再进 ``_state`` 的锁（SLF-A-01）：_collect_stale 的判据
+    # 里有「本轮命中数」，而计数由 MCDR 主线程在 filter_server_info 里写，本函数却跑在
+    # task executor 线程（plugin_manager.dispatch_event 的默认策略 always_new_task）——
+    # 裸读 rule.count 可能刚好读到写入前的那一刻。counted_hits() 走过滤器自己的锁，
+    # 与状态页是同一条口径。
     rules = list(_log_filter.rules)
+    counts = _log_filter.counted_hits(rules)
     with _state_mutex():
-        stale = _collect_stale(_state, rules, _config.stale_rule_threshold)
+        stale = _collect_stale(_state, rules, counts, _config.stale_rule_threshold)
     if stale:
         _emit_stale_warning(server, stale, _config.stale_rule_threshold)
 """
@@ -56,8 +60,8 @@ def disable_warning(src):
 
 def threshold_off_by_one(src):
     return src.replace(
-        "if entry is not None and entry.zero_streak >= threshold and rule.count == 0:",
-        "if entry is not None and entry.zero_streak > threshold and rule.count == 0:  # mutation",
+        "if entry is not None and entry.zero_streak >= threshold and count == 0:",
+        "if entry is not None and entry.zero_streak > threshold and count == 0:  # mutation",
     )
 
 def drop_startup_guard(src):
@@ -97,7 +101,11 @@ def warn_before_startup(src):
         and _config.warn_about_stale_rules
         and _config.stale_rule_threshold > 0
     ):
-        _m = _collect_stale(_state, list(_log_filter.rules), _config.stale_rule_threshold)
+        _m_rules = list(_log_filter.rules)
+        _m = _collect_stale(
+            _state, _m_rules, _log_filter.counted_hits(_m_rules),
+            _config.stale_rule_threshold,
+        )
         if _m:
             _emit_stale_warning(server, _m, _config.stale_rule_threshold)
 """
@@ -167,10 +175,7 @@ def silence_reset_announcement(src):
 PRUNE_ON_LOAD = (
     "    _announce_pruned(server, _prune_state(server, _state, _config.patterns))\n"
 )
-PRUNE_ON_RELOAD = (
-    "    configured = list(_config.patterns)\n"
-    "    pruned = [] if _state is None else _prune_state(server, _state, configured)\n"
-)
+PRUNE_RELOAD_STEP = "            pruned = _prune_state(server, _state, configured)\n"
 PRUNE_CALL = "    removed = _forget_orphans(state, patterns)\n"
 RESET_GUARD = "    if _config_was_reset:\n"
 
@@ -179,8 +184,12 @@ def drop_prune_on_load(src):
     return src.replace(PRUNE_ON_LOAD, "    pass  # mutation: no prune on load\n")
 
 def drop_prune_on_reload_command(src):
-    """!!logfilter reload 不再清理已删除规则的统计。"""
-    return src.replace(PRUNE_ON_RELOAD, "    pruned = []  # mutation: no prune on reload\n")
+    """!!logfilter reload 不再清理已删除规则的统计。
+
+    锚点跟着 SLF-A-08 的重构走：清理那一步现在住在 ``try`` 里（失败只降级为说明），
+    所以直接替换那一条调用。
+    """
+    return src.replace(PRUNE_RELOAD_STEP, "            pruned = []  # mutation: no prune on reload\n")
 
 def prune_against_compiled_rules(src):
     """按「编译成功的规则」而不是「配置原文」判断孤立项 —— 会误删被安全探测拦下的规则。"""
@@ -247,14 +256,15 @@ def silence_the_unreadable_catalogue_warning(src):
 
 
 def silence_the_language_probe_failures(src):
-    """探测性失败（语言探测 / 语言目录列举）不再留痕 —— 中文管理员会突然看到英文。"""
+    """探测性失败（语言探测 / 语言目录列举）不再留痕 —— 中文管理员会突然看到英文。
+
+    锚点跟着 SLF-A-12 的修复走：``_note`` 现在返回「是否真的写入了」（``i18n`` 的兜底
+    分支靠它判断），所以这里插一句 ``return False``，等价于「记不下任何诊断」。
+    """
     return src.replace(
-        "def _note(key: str, key_name: str, **kwargs) -> None:\n"
-        '    """在当前上下文的诊断表里记一条（没有上下文就丢弃，绝不抛异常）。"""\n'
-        "    bucket = _notes.get()\n",
-        "def _note(key: str, key_name: str, **kwargs) -> None:  # mutation: swallow\n"
-        "    return\n"
-        "    bucket = _notes.get()\n",
+        "def _note(key: str, key_name: str, **kwargs) -> bool:\n",
+        "def _note(key: str, key_name: str, **kwargs) -> bool:  # mutation: swallow\n"
+        "    return False\n",
         1,
     )
 
@@ -303,12 +313,18 @@ def drop_the_probe_floor(src):
 
 
 def drop_the_test_prefix_strip(src):
-    """!!logfilter test 不再剥掉控制台前缀 —— `^` 锚定的规则会被误报成不命中。"""
+    """!!logfilter test 不再剥掉控制台前缀 —— `^` 锚定的规则会被误报成不命中。
+
+    锚点跟着 SLF-A-02 的修复走：剥前缀那几行从 ``_test_line`` 搬进了
+    ``_matching_body``（过滤与 ``test`` 共用的一处），但语义没变。
+    """
     return src.replace(
-        "    if _LOG_LINE_PREFIX.match(text):\n"
-        '        body = _LOG_LINE_PREFIX.sub("", text, count=1)\n',
-        "    if False:  # mutation: no prefix strip\n"
-        '        body = _LOG_LINE_PREFIX.sub("", text, count=1)\n',
+        "    if isinstance(source, str):\n"
+        "        if not _LOG_LINE_PREFIX.match(source):\n"
+        "            return source\n",
+        "    if isinstance(source, str):\n"
+        "        if True:  # mutation: no prefix strip\n"
+        "            return source\n",
     )
 
 
@@ -435,10 +451,14 @@ def strip_without_keeping_line_numbers(src):
 
 
 def zero_the_counts_on_a_command_reload(src):
-    """命令重载又回到「计数清零」—— 本轮已命中的次数被抹掉。"""
+    """命令重载又回到「计数清零」—— 本轮已命中的次数被抹掉。
+
+    ``reload_rules`` 里 ``_carry_counts(...)`` 既把旧计数搬到新规则对象上、又返回
+    「接续到的命中数之和」，所以把这一行换成 ``return 0`` 就等于整个接续逻辑消失。
+    """
     return src.replace(
-        "            self._total = _carry_counts(self._rules, previous)\n",
-        "            self._total = 0  # mutation\n",
+        "            return _carry_counts(self._rules, previous)\n",
+        "            return 0  # mutation\n",
     )
 
 
@@ -464,7 +484,7 @@ def count_only_the_first_matching_rule(src):
 def stale_criterion_drops_the_session_count(src):
     """SLF-02/05 的判据回归：``_collect_stale`` 不再看「本轮是否真的零命中」。"""
     return src.replace(
-        "if entry is not None and entry.zero_streak >= threshold and rule.count == 0:",
+        "if entry is not None and entry.zero_streak >= threshold and count == 0:",
         "if entry is not None and entry.zero_streak >= threshold:  # mutation\n",
     )
 
@@ -545,6 +565,68 @@ def let_the_timestamp_follow_the_file_mtime(src):
         "            info = zipfile.ZipInfo(\n"
         "                rel, date_time=zipfile.ZipInfo.from_file(path).date_time\n"
         "            )  # mutation: follow the file mtime\n",
+    )
+
+
+def overwrite_the_action_flag_again(src):
+    """SLF-A-03 的回归锚点：命中又**整体赋值**，把别的插件设的位抹掉。
+
+    MCDR 的 ``put_info`` 按注册顺序跑遍所有 filter，返回 False 的那个已经把
+    ``action_flag`` 置成 ``discarded()``，别的插件也可能 ``cancel_send_to_server()``；
+    整体赋值会把它们抹回来——被丢弃的行又开始派发事件、被拦下的命令照发。
+    """
+    return src.replace(
+        "        info.action_flag &= self._hide_mask\n",
+        "        info.action_flag = self._hide_mask  # mutation: other filters' bits overwritten\n",
+    )
+
+
+def count_hits_instead_of_lines(src):
+    """SLF-A-04 的回归锚点：``total`` 又变回「各规则命中数之和」。
+
+    一行被两条重叠规则命中时它会加 2，而状态页与关服汇报把它当「已隐去的行数」印出来。
+    """
+    return src.replace(
+        "                if count_line:\n                    self._total += 1\n",
+        "                if count_line:\n                    self._total += len(hit)  # mutation\n",
+    )
+
+
+def count_console_input_too(src):
+    """SLF-A-04 的另一半：控制台输入又混进「已隐去多少行服务端日志」。
+
+    ``echo_to_console`` 只对服务端输出生效（``info_reactor_manager.put_info``），
+    管理员敲的那一行并没有被隐去。
+    """
+    return src.replace(
+        "        if not self.count_matches(content, count_line=not getattr(info, \"is_from_console\", False)):\n",
+        "        if not self.count_matches(content):  # mutation: console input counted\n",
+    )
+
+
+def let_a_blank_body_return_early(src):
+    """SLF-A-07 的回归锚点：空正文又提前 return。
+
+    只匹配空串的规则（``^$``）于是在真实过滤里一次也不命中，而插件一边为它发
+    catch-all 告警、``!!lf test`` 一边回答「会被隐去」。
+    """
+    return src.replace(
+        "        if content is None:\n            return\n",
+        "        if not content:\n            return  # mutation: blank body skipped\n",
+    )
+
+
+def drop_the_player_prefix_strip(src):
+    """SLF-A-02 的回归锚点：``!!lf test`` 不再剥玩家发言的 ``<玩家名> `` 前缀。
+
+    真实过滤拿到的是 MCDR 剥好的正文（``hello there``），而命令侧留着 ``<Steve> `` 去匹配，
+    于是 ``^hello`` 这类**正确**的规则被报成「不会被隐去」。
+    """
+    return src.replace(
+        "        player = _PLAYER_CHAT_PREFIX.match(body)\n"
+        "        if player is not None and _PLAYER_NAME.fullmatch(player.group(\"name\")):\n"
+        "            body = body[player.end():]\n",
+        "        # mutation: the player-name prefix is left in the body\n",
     )
 
 
@@ -670,6 +752,19 @@ MUTATIONS = [
     ("the zip timestamp follows the file mtime", PACK,
      let_the_timestamp_follow_the_file_mtime,
      ["tests/test_plugin.py", "-k", "identical_bytes or pinned_timestamp"]),
+    # 第三轮审查（SLF-A-02 / A-03 / A-04 / A-07）的四个回归锚点：都是本轮改掉的语义，
+    # 没有守卫的话以后有人「顺手改回去」测试也不会红。
+    ("the action flag overwritten again", SRC, overwrite_the_action_flag_again,
+     ["tests/test_plugin.py", "-k", "only_clears_the_echo_bit"]),
+    ("hits counted instead of hidden lines", SRC, count_hits_instead_of_lines,
+     ["tests/test_plugin.py", "-k",
+      "every_matching_rule_is_counted or console_input_is_not_counted"]),
+    ("console input counted as a hidden server line", SRC, count_console_input_too,
+     ["tests/test_plugin.py", "-k", "console_input_is_not_counted"]),
+    ("a blank body returns early again", SRC, let_a_blank_body_return_early,
+     ["tests/test_plugin.py", "-k", "blank_body_line_is_really_matched"]),
+    ("the player-name prefix left in the body", SRC, drop_the_player_prefix_strip,
+     ["tests/test_plugin.py", "-k", "agrees_with_the_real_filter"]),
 ]
 
 #: pytest 摘要里两个必须分开看的数字。**这是本工具最重要的判据**：

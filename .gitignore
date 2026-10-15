@@ -16,7 +16,9 @@ pytest-cache-files-*/
 
 # 本地配置与私密文件
 .env
-config/
+# 锚定到仓库根：无锚定的 config/ 会连包目录里任何叫 config/ 的子目录一起吞掉
+# （server_log_filter/config/… 会被静默忽略，git add 既不报错也不加入）。
+/config/
 
 # 构建产物（.mcdr 请通过 Releases 分发）
 *.mcdr

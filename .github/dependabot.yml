@@ -1,0 +1,13 @@
+# The workflow pins every action to a commit SHA, which is what makes a moved tag unable to
+# change what CI runs — and also what makes an upgrade invisible without this file. Dependabot
+# understands the `# vX.Y.Z` comment next to a SHA pin and rewrites both, so the pin stays exact
+# and the upgrade arrives as a reviewable PR instead of a silent tag move.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

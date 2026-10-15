@@ -53,7 +53,7 @@ Running several backends? Put one copy in each; configurations are independent.
 |---|---|
 | `!!logfilter` (= `!!logfilter help`) | Help page (each line is clickable in in-game chat) |
 | `!!logfilter list` | Status: active language and where it comes from, per-rule hits and idle streaks, number of skipped rules |
-| `!!logfilter test <text>` | Whether a line would be hidden, and which rule matches; pasting the whole console line works too (the `[time] [thread/level]:` prefix is stripped first) |
+| `!!logfilter test <text>` | Whether a line would be hidden, and which rule matches; pasting the whole console line works too (the `[time] [thread/level]:` prefix is stripped first, and for player chat so is the `<name> ` prefix) |
 | `!!logfilter reload` | Re-read the config and apply it immediately, no restart needed; statistics for rules removed from the config are cleared as well |
 | `!!logfilter reset` | Clear the idle-session counters and start observing again |
 
