@@ -1,6 +1,6 @@
 # 测试 / Tests
 
-本目录是 Server Log Filter 的测试套件。**363 个用例**，覆盖过滤行为、配置、
+本目录是 Server Log Filter 的测试套件。**414 个用例**，覆盖过滤行为、配置、
 命令面、发布打包、**真实 MCDR 端到端**、**多语言**、**并发**，以及本插件最核心的
 安全属性（被隐去的行仍保留 `process`，事件照常分发）。
 
@@ -31,8 +31,11 @@ PYTHONPATH=.testlibs python -m pytest tests -v
 $env:PYTHONPATH=".testlibs"; python -m pytest tests -v
 ```
 
-CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过端到端，Python 3.10 / 3.13）、
-`mutation`、`e2e` 三个 job。跨版本矩阵不在 CI 里（需要三个各装了不同 MCDR 的环境），发版前本地跑。
+CI（`.github/workflows/ci.yml`）跑的就是同一批命令，共 **6 个 job**：`lint`（ruff）、
+`unit`（跳过端到端，Python **3.9 / 3.13**）、`mutation`、`e2e`（真实 MCDR）、
+`mcdr-matrix`（2.15.0 / 2.15.7 / 2.16.0 各一个作业，外加「MCDR 2.15.0 × Python 3.9」这个
+下限组合）、`artifact`（打包可复现且可加载）。**跨版本矩阵在 CI 里**；本地跑它的理由不是
+补 CI 的缺口，而是**早发现**——不必等 CI 排队就知道这一改在最低支持版本上成不成立。
 
 ⛔ **`python tools/mutation_check.py` 不接受 `MCDR_SKIP_E2E`**：有一条变异只有端到端测试能抓住，
 跳过 e2e 会让它被 pytest skip → 退出码 0 → 被误报成「测试没抓住」。脚本会直接拒绝运行并说明原因。
@@ -40,7 +43,7 @@ CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过�
 预期输出结尾：
 
 ```
-363 passed
+414 passed
 ```
 
 > **开发中不用每次都跑全量。** 改哪一块就只跑那一块，确认当前版本能过即可，例如
@@ -54,9 +57,9 @@ CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过�
 
 | 分组 | 约 | 说明 |
 |---|---|---|
-| 过滤行为与安全属性 | 30 | 目标刷屏行命中（3）；15 类关键行逐一验证**不**被误伤；`content` 为 `""`/`None`/纯空白不崩溃（5）；`hidden()` 保留 `process` 且绝不等于 `discarded()` |
+| 过滤行为与安全属性 | 31 | 目标刷屏行命中（3）；15 类关键行逐一验证**不**被误伤；`content` 为 `""`/`None`/纯空白不崩溃（5）；命中只清掉 `echo_to_console` 一位，其余位（含别人刚设的 `discarded()` / `cancel_send_to_server()`）原样保留（2） |
 | 规则编译与容错 | 4 | 非法正则被跳过并告警，其余规则照常工作；空/空白规则静默丢弃 |
-| 计数、重载与重置 | 14 | 多规则独立计数；**`reload` 接续同名规则的计数**（旧版会归零，那是 1.4.1 修掉的 bug）；被删掉的规则才丢计数；**一行命中的每条规则都计数**（1.4.2 改掉的旧语义：以前只计第一条，见下） |
+| 计数、重载与重置 | 15 | 多规则独立计数；**`reload` 接续同名规则的计数**（旧版会归零，那是 1.4.1 修掉的 bug）；被删掉的规则才丢计数；**一行命中的每条规则都计数**（1.4.2 改掉的旧语义：以前只计第一条，见下）；**`_total` 是隐去的行数**（第三轮改掉：以前等于各规则命中数之和，且把控制台输入也算了进去） |
 | 配置对象 | 3 | 默认值与 README 文档一致；JSON 反序列化；往返稳定 |
 | MCDR 契约 | 2 | `InfoActionFlag.hidden()` 的常量构成；`InfoFilter` 允许改写 `action_flag` |
 | 命令面与元数据 | 8 | `on_load` 注册项；状态/测试/重载命令输出；`reload` 的 ADMIN 权限门禁；插件元数据与 `MIN_MCDR_VERSION` 同步 |
@@ -74,9 +77,15 @@ CI（`.github/workflows/ci.yml`）跑的就是同一批命令：`unit`（跳过�
 | **1.3.0 的修复** | **9** | 非 UTF-8 配置被备份而非致命（2）、`test` 剥掉控制台前缀（2）、状态里显示语言来源与被跳过的规则（2）、量化符溢出与深层嵌套不再致命（2）、坏模板的 `AttributeError`（1） |
 | **端到端（真实 MCDR）** | **35** | 见下。这一项是**独立的一整份文件**（`tests/test_e2e.py`），不与上面各组的用例重叠 |
 | **生命周期与并发** | **14** | `on_load` 提前 return（低版本 MCDR）之后走完整生命周期不抛异常、模块级全局被显式重置；`state.json` 损坏时备份 + 告警；`_state` 的读改写共用一把锁；多线程真实入口小规模压测 |
-| **合计** | **363** | |
+| **正文取值路径与空正文** | **42** | `!!lf test` 与真实过滤在**三种来源**上结论一致（40，参数化：8 种规则形态 × 5 种行），外加控制台输入（1）与「前缀 + 空正文」真的会被 `^$` 命中（1） |
+| **锁、谎报与死代码** | **5** | 零命中提醒读计数持过滤器锁；`reset` 写盘失败不谎报成功；`reload` 在换完规则后失败要说「已生效」；状态页读 `_state` 持锁；`i18n` 的目录列举失败在无上下文时也留痕 |
+| **合计** | **414** | |
 
 > 计数含 `@pytest.mark.parametrize` 展开后的用例数，与 `pytest --collect-only` 一致。
+>
+> 上表是第三轮审查（SLF-A-01…A-12 + REPO-18/24/26/29/30）修复后重数的结果：新增 **51** 条
+> ——正文取值路径一致性 40、控制台输入与空正文 2、命中只清 `echo_to_console` 一位 1、
+> 控制台输入不计入隐去行数 1、锁与谎报 5、矩阵工具的编码与换行 2。
 
 ## 端到端测试（`tests/test_e2e.py`）
 
@@ -157,8 +166,8 @@ if handler.test_server_startup_done(info):
 
 - `handler_detection: false` —— MCDR 的处理器自动探测会先采样**一整分钟**
   （`HANDLER_DETECTION_MINIMUM_SAMPLING_TIME = 60`）才启动服务端，必须关掉并显式指定 handler。
-- `start_command` 里的解释器路径**要加引号**：路径含空格（如 `Paul LAM`）时，不加引号会被
-  `cmd.exe` 截断成 `'C:\Users\Paul' is not recognized...`。
+- `start_command` 里的解释器路径**要加引号**：路径含空格（如 `C:\MC Server\python.exe`）时，
+  不加引号会被 `cmd.exe` 截断成 `'C:\MC' is not recognized...`。
 
 端到端组共用一个 MCDR 实例（约 5～6 秒，仅启动一次 MCDR）；但**与语言有关的四条
 必须单独起实例**（要换 MCDR 的 `language` 或插件的 `language`，配置不同），
@@ -345,7 +354,7 @@ JSON 很严格，手工加规则时漏一个逗号就会解析失败，而 MCDR 
 python tools/mutation_check.py
 ```
 
-脚本会依次注入 51 个缺陷，要求相关用例变红；全绿即视为测试失效。
+脚本会依次注入 60 个缺陷，要求相关用例变红；全绿即视为测试失效。
 
 > **判定看 pytest 的退出码：只有 `exit == 1` 才算「被抓住」。** `4`（命令行用法错误）
 > 和 `5`（没收集到用例）都说明**脚本自己写错了**，不是测试变红——早期把 `4` 也当命中，
@@ -417,10 +426,17 @@ README 的「已验证内容」一节描述了这些行为，但此前仓库中�
 本套件把那些描述变成了**可重复执行**的断言，其中最关键的一条是：
 
 ```python
-info.action_flag = InfoActionFlag.hidden()   # 只摘控制台回显
+# 只摘控制台回显，别人设的位一个都不动
+info.action_flag &= InfoActionFlag.default() ^ InfoActionFlag.echo_to_console
 assert InfoActionFlag.process in info.action_flag        # 事件分发保留
 assert InfoActionFlag.echo_to_console not in info.action_flag
+assert InfoActionFlag.send_to_server in info.action_flag # 没被别人拦下时照旧发给服务端
 ```
+
+（掩码写成 `default() ^ echo_to_console` 而不是 `~echo_to_console`：等价，但不在旧解释器上
+赌 `enum.Flag.__invert__` 是否存在。第三轮审查 **SLF-A-03** 改掉的正是「整体赋值成
+`hidden()`」：MCDR 会按注册顺序跑遍所有 filter，整体赋值会把别的插件刚设的 `discarded()` /
+`cancel_send_to_server()` 抹回来。）
 
 这条断言在真实 MCDR 2.16.0 上运行，因此如果未来 MCDR 改变了 `hidden()` 的语义，
 测试会立刻失败，而不是让插件在用户的服务器上静默出问题。

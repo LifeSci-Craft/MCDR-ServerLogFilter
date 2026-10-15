@@ -23,10 +23,13 @@
   "reload.carried_session": "; the {count} hit(s) already counted this session are kept",
   "reload.failed": "[ServerLogFilter] !!logfilter reload failed: {error}",
   "reload.failed_reply": "Reload failed; the previous rules are still in force. See the MCDR log for details: {error}",
+  "reload.prune_failed": "[ServerLogFilter] the new rules are in force, but clearing the statistics of deleted rules from state.json failed: {error}",
+  "reload.prune_failed_reply": "; the {count} rule(s) are in force, but clearing the old statistics failed: {error}",
   "session.report": "Hidden {total} server log line(s) from the MCDR console this run (the server log file is unaffected)",
   "help.logfilter": "Server log filter (!!lf): show status / test a line / reload the rules",
   "state.save_failed": "Failed to write the filter statistics (state.json)",
   "state.reset_save_failed": "Failed to write state.json",
+  "state.reset_save_failed_reply": "The idle-session counters in memory were cleared (so no reminder this session), but writing state.json failed ({error}); the old counters will be back after a restart or reload",
   "state.broken_backup": "[ServerLogFilter] state.json could not be read, so it was backed up as {backup} and the plugin continues with empty statistics. The hit history and idle-session counters start counting again from zero.",
   "state.pruned_header": "[ServerLogFilter] Cleared {count} rule statistic(s) from state.json (they are no longer in the configured patterns)",
   "state.pruned_entry": "  - {pattern}",
@@ -92,5 +95,5 @@
   "test.hit_detail": "    matched by: ",
   "test.miss": "would not be hidden",
   "test.miss_detail": "    no rule matches this line",
-  "test.stripped_note": "(the [time] [thread/level]: prefix was stripped, so this tested the body that is actually matched)"
+  "test.stripped_note": "(the [time] [thread/level]: prefix and, for player chat, the <name> prefix were stripped, so this tested the body that is actually matched)"
 }

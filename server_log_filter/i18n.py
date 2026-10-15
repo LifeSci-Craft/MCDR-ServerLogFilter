@@ -106,21 +106,28 @@ def _list_lang_files(notes: Optional[Dict[str, str]] = None) -> List[str]:
 
     The bucket is filled through the plugin's ``_note`` helper (imported lazily to keep
     this module free of an import cycle), so entries arrive already translated and
-    formatted and the caller only has to join them.
+    formatted and the caller only has to join them. When there is no active contextvar --
+    a debug script importing this module on its own -- ``_note`` writes nothing, so an
+    untranslated line goes into ``notes`` instead of the failure disappearing.
     """
 
     def record(key: str, error: BaseException) -> None:
         if notes is None:
             return
         detail = "{}: {}".format(type(error).__name__, error)
-        # Prefer the plugin's ``_note`` so the entry gets translated right away (see the
-        # docstring). It is only reachable while the plugin has set up its contextvar;
-        # a standalone caller of this module gets the untranslated form, not silence.
+        # With an active contextvar (the plugin's own path) the entry goes through
+        # ``_note`` and comes out translated. Without one, ``_note`` merely drops it, so
+        # the untranslated form is written into the caller's bucket here. Deciding on
+        # ``_note``'s **return value** instead of on an exception is the fix for
+        # SLF-A-12: ``_note`` never raises, so the old ``except TypeError`` branch was
+        # unreachable and a standalone caller got silence.
         try:
             from . import _note
-
-            _note("language.list_failed", key, api=key, error=detail)
-        except TypeError:  # 没有 _note（单独 import 本模块）或没有活动上下文
+        except ImportError:  # imported outside the plugin package
+            wrote = False
+        else:
+            wrote = _note("language.list_failed", key, api=key, error=detail)
+        if not wrote:
             notes[key] = "{} failed (api={}, error={})".format(key, key, detail)
 
     try:

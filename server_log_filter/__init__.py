@@ -5,8 +5,11 @@
 见 README.md 与 benchmarks/bench_filter.py。
 
 四条不能改的底线（原因与教训见 docs/DEVELOPMENT.md「实现注记」）：
-1. 必须用 ``InfoActionFlag.hidden()``，不能 ``return False`` —— 后者等于
-   ``discarded()``，会让 MCDR 的启动 / 停止 / 玩家进出检测失效。
+1. 命中时只能**按位清掉** ``echo_to_console``（``action_flag &= self._hide_mask``）。
+   既不能 ``return False`` —— 那等于 ``discarded()``，会让 MCDR 的启动 / 停止 /
+   玩家进出检测失效；也不能整体赋值成 ``hidden()`` —— MCDR 会按注册顺序跑遍所有
+   filter，整体赋值会把别的插件刚设的 ``discarded()`` / ``cancel_send_to_server()``
+   抹回来（SLF-A-03）。
 2. ``filter_server_info`` 跑在 MCDR 主线程，只做「按顺序短路匹配」，别加额外开销。
 3. 任何一条消息都不允许因为配置或语言文件写坏而抛异常。
 4. 文案一律走 ``_t()``（见 lang/<语言代码>.json），代码里不写死面向用户的句子。
@@ -172,6 +175,54 @@ def _carry_counts(rules, previous: Dict[str, int]) -> int:
     return carried
 
 
+# 控制台整行的前缀（``[12:00:00] [Server thread/INFO]: ``）。``!!lf test`` 收到的是
+# 管理员整行复制的原文，而过滤器匹配的是**剥离之后的正文**，所以两条路径都要经
+# ``_matching_body``（SLF-A-02）。
+_LOG_LINE_PREFIX = re.compile(r"^\[[^\]]*\]\s*\[[^\]]*\]\s*:\s?")
+
+# 玩家发言的玩家名前缀。MCDR 的 vanilla handler 剥掉控制台前缀之后**还会**把
+# ``<Steve> `` 这一截从正文里剥掉（``get_player_message_parsing_formatter``），而且只在
+# 名字通过 ``[a-zA-Z0-9_]{3,16}`` 校验时才当它是玩家发言。这里照抄这两条判据。
+#
+# 为什么是照抄而不是调用 MCDR 自己的解析器：MCDR 没有公开的「拿当前 server handler」
+# 接口（``ServerInterface`` 里那个是私有属性），从插件里够到它只能走
+# ``server._mcdr_server`` 这类内部结构——那会让一次 MCDR 小版本升级把 ``!!lf test``
+# 打坏。所以这里只复刻这一条最小规则，并且**只在这一处**复刻。
+_PLAYER_CHAT_PREFIX = re.compile(r"^(?:\[Not Secure\] )?<(?P<name>[^>]+)> ")
+_PLAYER_NAME = re.compile(r"[a-zA-Z0-9_]{3,16}")
+
+
+def _matching_body(source) -> Optional[str]:
+    """取出**真正参与匹配的正文**——这是唯一的取值路径（SLF-A-02）。
+
+    ``source`` 有两种形态，两条路径都必须经这里：
+
+    * MCDR 交给过滤器的 ``Info``：正文就是 ``info.content``，读不到时退回 ``raw_content``；
+    * 管理员在 ``!!lf test`` 里粘贴的控制台整行（``str``）：整行**不是**正文，要先按
+      MCDR 自己的两步剥——``[时间] [线程/级别]:`` 与玩家发言的 ``<玩家名> ``。
+
+    少了第二步，同一条规则会在两条路径上给出相反结论：``^hello`` 这类**正确**的规则
+    被报成「不会被隐去」（假阴性，管理员于是去改一条本来就对的规则），而含玩家名前缀的
+    规则被报成「会被隐去」却在真实过滤上永不命中（假阳性）。
+
+    没有控制台前缀的 ``str`` 原样返回：MCDR 自己也只有认得出这个前缀时才做玩家发言
+    解析（认不出就退回 basic handler，正文就是整行），这里必须与它一致。
+    """
+    if isinstance(source, str):
+        if not _LOG_LINE_PREFIX.match(source):
+            return source
+        body = _LOG_LINE_PREFIX.sub("", source, count=1)
+        player = _PLAYER_CHAT_PREFIX.match(body)
+        if player is not None and _PLAYER_NAME.fullmatch(player.group("name")):
+            body = body[player.end():]
+        return body
+
+    content = source.content
+    if content is None:
+        content = getattr(source, "raw_content", None)
+    return content
+
+
 class ServerLogFilter(InfoFilter):
     """按规则把匹配的服务端输出从控制台隐去。
 
@@ -187,6 +238,11 @@ class ServerLogFilter(InfoFilter):
     代价与补偿：最坏情况下每行要跑完全部规则（原来是找到第一条就停）。规则本身是
     预编译的 ``re.search``，实测仍在微秒级——数字见 docs/DEVELOPMENT.md
     「热路径的预算」，那里也记着"合并成一个正则反而更慢"的实测结论。
+
+    另一个计数口径（SLF-A-04）：``total``（状态页的「本次已隐去」、关服汇报的行数）
+    是**隐去的行数**，一行命中几条规则都只加一；各规则的 ``count`` 才是「各命中几次」。
+    两者一般不相等，说明文字在 ``status.counting_note`` 里；控制台输入不计入行数
+    （MCDR 的 ``echo_to_console`` 只对服务端输出生效）。
     """
 
     def __init__(self, rules: List[Rule], logger, log_matched_lines: bool):
@@ -197,8 +253,15 @@ class ServerLogFilter(InfoFilter):
         # 计数在主线程写、命令线程读，需要锁；只在命中路径上取，不影响逐行开销
         self._lock = threading.Lock()
         self._total = 0
-        # hidden() 是不变常量，算一次就够了，省掉命中路径上的一个函数调用
-        self._hidden_flag = InfoActionFlag.hidden() if InfoActionFlag is not None else None
+        # 命中时只把 echo_to_console 清掉的掩码，算一次就够了，省掉命中路径上的一个
+        # 函数调用。写成 ``default() ^ echo_to_console``（= 全部位去掉 echo 这一位）
+        # 而不是 ``~InfoActionFlag.echo_to_console``：``enum.Flag.__invert__`` 在旧解释器
+        # 上不保证存在，而本插件的底线是 Python 3.9。
+        self._hide_mask = (
+            InfoActionFlag.default() ^ InfoActionFlag.echo_to_console
+            if InfoActionFlag is not None
+            else None
+        )
 
     @property
     def rules(self) -> Tuple[Rule, ...]:
@@ -222,27 +285,35 @@ class ServerLogFilter(InfoFilter):
             return [rule.count for rule in target]
 
     def carry_over_from(self, previous: Optional["ServerLogFilter"]) -> int:
-        """接续上一份实例的命中数（插件重载路径），否则一次开服周期会被切成两段。"""
+        """接续上一份实例的计数（插件重载路径），否则一次开服周期会被切成两段。
+
+        逐条规则的 ``count`` 按 pattern 搬过来，``total``（**已隐去的行数**）原样接续
+        ——重载不该让「本次已隐去」归零（SLF-A-04）。返回值是接续到的**规则命中数
+        之和**，只用于日志里那句「接续 N 条命中计数」。
+        """
         if previous is None:
             return 0
+        previous_total = previous.total
         previous_counts = {rule.pattern: rule.count for rule in previous.rules if rule.count}
         with self._lock:
-            self._total = _carry_counts(self._rules, previous_counts)
-            return self._total
+            self._total = previous_total
+            return _carry_counts(self._rules, previous_counts)
 
     def reload_rules(self, rules: List[Rule], log_matched_lines: bool) -> int:
-        """就地替换规则，无需重新注册 InfoFilter；返回接续过来的命中数。
+        """就地替换规则，无需重新注册 InfoFilter；返回接续过来的**规则命中数之和**。
 
         **同名规则要接着数。** 管理员通常在服务端运行中改配置、敲 `!!logfilter reload`，
         从零开始数会把这一轮已经命中的次数抹掉——规则明明在工作，却被记成「零命中」。
         只有真的从配置里删掉的规则，它的计数才该消失。
+
+        ``_total`` 是行数而不是各规则计数之和（SLF-A-04），所以它**不按被删掉的规则
+        重算**：那些行确实已经被隐去了，删规则不该改写「本次已隐去多少行」。
         """
         with self._lock:
             previous = {rule.pattern: rule.count for rule in self._rules if rule.count}
             self._rules = tuple(rules)
             self._log_matched_lines = log_matched_lines
-            self._total = _carry_counts(self._rules, previous)
-            return self._total
+            return _carry_counts(self._rules, previous)
 
     def reset_counters(self) -> None:
         with self._lock:
@@ -250,13 +321,18 @@ class ServerLogFilter(InfoFilter):
             for rule in self._rules:
                 rule.count = 0
 
-    def count_matches(self, content: str) -> List[Rule]:
+    def count_matches(self, content: str, count_line: bool = True) -> List[Rule]:
         """给这一行命中的**每一条**规则计数，并按 ``self._rules`` 顺序返回它们。
 
         逐行热路径用它。为什么不再"遇到第一条就 return"：那样只有第一条规则的统计
         在动，被它遮蔽的规则 ``count`` 永远是 0、``zero_streak`` 一路涨到阈值，插件
         就会建议管理员删掉一条**正在正常工作**的规则（SLF-02）。一行命中几条就记几条，
         而"隐去"仍然只需要发生一次。
+
+        ``count_line`` 为真时同时把 ``total``（**已隐去的行数**）加一——一行命中几条
+        规则都只加一（SLF-A-04）。控制台输入要传假：MCDR 的 ``echo_to_console`` 只对
+        服务端输出生效（``info_reactor_manager.put_info``），把它算进「已隐去多少行
+        服务端日志」会让状态页与关服汇报多报。
         """
         hit: List[Rule] = []
         for rule in self._rules:
@@ -266,7 +342,8 @@ class ServerLogFilter(InfoFilter):
             with self._lock:
                 for rule in hit:
                     rule.count += 1
-                self._total += len(hit)
+                if count_line:
+                    self._total += 1
         return hit
 
     def match(self, content: str) -> Optional[Rule]:
@@ -289,16 +366,23 @@ class ServerLogFilter(InfoFilter):
         if not rules:
             return
 
-        content = info.content
+        content = _matching_body(info)
+        # 空串也是合法正文（``[12:00:00] [Server thread/INFO]: `` 这种行 MCDR 给出的
+        # content 就是空串）：旧写法 ``if not content`` 会把 ``^$`` 这类规则永久挡在
+        # 门外，而插件一边为它发 catch-all 告警、``!!lf test`` 一边回答「会被隐去」
+        # ——三处说法互相矛盾（SLF-A-07）。只有真的拿不到正文才早退。
         if content is None:
-            content = getattr(info, "raw_content", None)
-        if not content:
             return
 
-        if not self.count_matches(content):
+        # 控制台输入不算「已隐去的服务端日志行」（SLF-A-04）：echo_to_console 只对
+        # 服务端输出生效。
+        if not self.count_matches(content, count_line=not getattr(info, "is_from_console", False)):
             return
 
-        info.action_flag = self._hidden_flag  # 不能 return False：那等于 discarded()
+        # **只清 echo_to_console 这一位**，不整体赋值（SLF-A-03）：MCDR 会按注册顺序
+        # 跑遍所有 filter，别的插件可能刚设过 discarded() 或 cancel_send_to_server()，
+        # 整体赋值会把它们抹回来（被丢弃的行又开始派发事件、被拦下的命令照发）。
+        info.action_flag &= self._hide_mask
 
         if self._log_matched_lines:
             self._logger.info(_t("rule.hidden", content=content))
@@ -613,11 +697,18 @@ _notes: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVa
 )
 
 
-def _note(key: str, key_name: str, **kwargs) -> None:
-    """在当前上下文的诊断表里记一条（没有上下文就丢弃，绝不抛异常）。"""
+def _note(key: str, key_name: str, **kwargs) -> bool:
+    """在当前上下文的诊断表里记一条，返回**是否真的记下了**。
+
+    没有活动上下文就丢弃，绝不抛异常——调用方靠返回值判断，而不是靠捕获异常
+    （``i18n._list_lang_files`` 就是这样做的，见 SLF-A-12：那里原来的兜底分支
+    因为这里从不抛而永远不可达）。
+    """
     bucket = _notes.get()
-    if bucket is not None:
-        bucket[key_name] = _t(key, **kwargs)
+    if bucket is None:
+        return False
+    bucket[key_name] = _t(key, **kwargs)
+    return True
 
 
 # ``_state`` 的读改写锁（SLF-08）。
@@ -633,6 +724,9 @@ def _note(key: str, key_name: str, **kwargs) -> None:
 #   ``<name>.tmp``。本插件内部的写盘都已在这把锁里，所以不会再并发写同一个文件；
 #   但同一目录上若有别的代码在写，仍可能互踩。详见 docs/DEVELOPMENT.md
 #   「state.json 的并发窗口」。
+# - **读侧同样经它取快照**（SLF-A-10）：状态页（``_show_status``）不是热路径，
+#   取锁的代价可以忽略，而免锁读会印出半新半旧的组合（streak 来自本轮、开服周期号
+#   来自上一轮）。于是「``_state`` 的每一次访问都在锁里」成为一条能一眼判断的规则。
 _state_lock_guard = threading.Lock()
 _state_lock: Optional[threading.Lock] = None
 
@@ -1100,22 +1194,25 @@ def _update_state_after_session(
 
 
 def _collect_stale(
-    state: State, rules: List[Rule], threshold: int
+    state: State, rules: List[Rule], counts: List[int], threshold: int
 ) -> List[Tuple[str, RuleState]]:
     """找回本轮**一次都没命中**、且零命中年数已达阈值的规则。
 
-    「本轮 count == 0」这一条判据不能少（SLF-02 / SLF-05）。命中路径遇到第一条
-    匹配就 return，所以一行命中多条重叠规则时只有第一条被计数；这会让**正在正常
-    工作的**规则长期 count == 0、zero_streak 一路涨到阈值，于是插件建议管理员把它
-    删掉——而删掉后对应日志立刻重新刷屏。加上「本轮真的零命中」之后，这类被遮蔽的
-    规则不会再被报成「从未命中」。它同时挡住了 SLF-05 那个假提醒：管理员把写错的
-    规则改对之后，若中间有一个周期没走到 startup（崩溃 / 手动 kill），残留的
-    zero_streak 会停在阈值上；下一轮它已经命中过（count > 0），于是不再重复告警。
+    ``counts`` 必须是与 ``rules`` 一一对应的**持锁快照**（``counted_hits()``），
+    本函数不裸读 ``rule.count``（SLF-A-01）：计数由 MCDR 主线程在
+    ``filter_server_info`` 里写，而本路径跑在 task executor 线程，裸读可能刚好读到
+    写入前的那一刻——一条正在命中的规则被读成 0，于是刚命中过的规则被弹
+    「连续 N 轮零命中，建议删除」，与本插件要消灭的那类噪音同类。
+
+    「本轮 count == 0」这一条判据也不能少（SLF-02 / SLF-05）：一行命中多条重叠规则时
+    每一条都会被计数，但仍可能有规则是真的没命中。它同时挡住了 SLF-05 那个假提醒：
+    管理员把写错的规则改对之后，若中间有一个周期没走到 startup（崩溃 / 手动 kill），
+    残留的 zero_streak 会停在阈值上；下一轮它已经命中过（count > 0），于是不再重复告警。
     """
     stale: List[Tuple[str, RuleState]] = []
-    for rule in rules:
+    for rule, count in zip(rules, counts):
         entry = state.rules.get(rule.pattern)
-        if entry is not None and entry.zero_streak >= threshold and rule.count == 0:
+        if entry is not None and entry.zero_streak >= threshold and count == 0:
             stale.append((rule.pattern, entry))
     return stale
 
@@ -1224,10 +1321,17 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
     _log_summary(server, rules)
 
 
-def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str], int]:
+def _apply_config(
+    server: PluginServerInterface,
+) -> Tuple[List[Rule], List[str], int, Optional[str]]:
     """重读配置并就地替换规则（不重新注册命令与过滤器）。
 
-    返回 ``(规则列表, 被清掉的旧规则统计, 接续过来的命中数)``。
+    返回 ``(规则列表, 被清掉的旧规则统计, 接续过来的命中数, 统计清理失败的原因)``。
+
+    最后一项是 SLF-A-08 的修法：``reload_rules`` **之后**才失败的步骤（写 state.json）
+    不能把整条命令说成「没生效」——规则那时已经在过滤线上跑了，管理员据此会去重复
+    reload / 重启、排查一个并不存在的问题。所以这里自己兜住清理的异常，把原因原样
+    交给调用方去回复，而不是让它穿出去变成「重载失败，规则保持原样」。
     """
     global _config
     _config = _load_config(server)
@@ -1243,8 +1347,15 @@ def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str],
     # 拿一份 patterns 的局部副本再交给清理：`_config` 是模块级对象，命令线程下一次
     # 重载会整体替换它（SLF-12）。
     configured = list(_config.patterns)
-    pruned = [] if _state is None else _prune_state(server, _state, configured)
-    return rules, pruned, carried
+    pruned: List[str] = []
+    prune_error: Optional[str] = None
+    if _state is not None:
+        try:
+            pruned = _prune_state(server, _state, configured)
+        except Exception as error:  # noqa: BLE001 - 规则已生效，清理失败只降级为说明
+            prune_error = "{}: {}".format(type(error).__name__, error)
+            server.logger.exception(_t("reload.prune_failed", error=prune_error))
+    return rules, pruned, carried, prune_error
 
 
 def on_server_start(server: PluginServerInterface) -> None:
@@ -1276,11 +1387,15 @@ def on_server_startup(server: PluginServerInterface) -> None:
     ):
         return
 
-    # 持 _state 锁读一份规则计数快照：_collect_stale 的判据里有 rule.count（SLF-02），
-    # 而计数由主线程写，读的时候要和其他统计路径一个口径（SLF-10）。
+    # 规则元组与计数快照都取好再进 ``_state`` 的锁（SLF-A-01）：_collect_stale 的判据
+    # 里有「本轮命中数」，而计数由 MCDR 主线程在 filter_server_info 里写，本函数却跑在
+    # task executor 线程（plugin_manager.dispatch_event 的默认策略 always_new_task）——
+    # 裸读 rule.count 可能刚好读到写入前的那一刻。counted_hits() 走过滤器自己的锁，
+    # 与状态页是同一条口径。
     rules = list(_log_filter.rules)
+    counts = _log_filter.counted_hits(rules)
     with _state_mutex():
-        stale = _collect_stale(_state, rules, _config.stale_rule_threshold)
+        stale = _collect_stale(_state, rules, counts, _config.stale_rule_threshold)
     if stale:
         _emit_stale_warning(server, stale, _config.stale_rule_threshold)
 
@@ -1454,6 +1569,17 @@ def _show_status(source) -> None:
     warned = list(_warned_patterns)
     rejected = list(_rejected_patterns)
     duplicate = list(_duplicate_patterns)
+    hidden_lines = _log_filter.total
+    # ``_state`` 的**读侧也走 ``_state_mutex()``**（SLF-A-10）：写侧
+    # （``_update_state_after_session`` / ``_prune_state`` / ``_reset_streaks``）都在
+    # 这把锁里，免锁读会印出半新半旧的组合（某条规则的 streak 来自本轮、开服周期号
+    # 来自上一轮），也让「哪些读加锁」在同文件里出现第三种口径（SLF-10 要消除的正是它）。
+    with _state_mutex():
+        streaks = {
+            pattern: (entry.last_hit_session, entry.zero_streak)
+            for pattern, entry in (_state.rules.items() if _state is not None else ())
+        }
+        session_index = _state.session_index if _state is not None else 0
 
     if i18n.normalize(_language_setting) in ("", i18n.AUTO):
         language_line = _t("status.language_auto", code=_language)
@@ -1463,7 +1589,7 @@ def _show_status(source) -> None:
         _title_line(),
         "\n",
         _field(_t("status.rule_count"), str(len(rules))),
-        _field(_t("status.hidden_now"), str(_log_filter.total) + _t("status.lines")),
+        _field(_t("status.hidden_now"), str(hidden_lines) + _t("status.lines")),
         "\n",
         _field(_t("status.language_label"), language_line, RColor.white),
     )
@@ -1487,22 +1613,22 @@ def _show_status(source) -> None:
         parts.append(RText(_t("status.rule_hits", count=counts[index - 1]), RColor.green))
         parts.append(RText("-- ", RColor.gray))
         parts.append(RText(rule.pattern, RColor.white))
-        entry = _state.rules.get(rule.pattern) if _state is not None else None
-        if entry is not None and entry.last_hit_session:
+        last_hit_session, zero_streak = streaks.get(rule.pattern, (0, 0))
+        if last_hit_session:
             parts.append(
                 RText(
-                    _t("status.last_hit", session=entry.last_hit_session),
+                    _t("status.last_hit", session=last_hit_session),
                     RColor.gray,
                 )
             )
-        if entry is not None and entry.zero_streak:
-            if threshold and entry.zero_streak >= threshold:
+        if zero_streak:
+            if threshold and zero_streak >= threshold:
                 parts.append(
-                    RText(_t("status.streak_warn", streak=entry.zero_streak), RColor.red)
+                    RText(_t("status.streak_warn", streak=zero_streak), RColor.red)
                 )
             else:
                 parts.append(
-                    RText(_t("status.streak", streak=entry.zero_streak), RColor.gray)
+                    RText(_t("status.streak", streak=zero_streak), RColor.gray)
                 )
 
     if warned:
@@ -1535,12 +1661,12 @@ def _show_status(source) -> None:
             )
         )
 
-    if _state is not None and _state.session_index:
+    if session_index:
         parts.append("\n")
         parts.append(
             _field(
                 _t("status.sessions_label"),
-                _t("status.sessions", count=_state.session_index),
+                _t("status.sessions", count=session_index),
                 RColor.white,
             )
         )
@@ -1564,7 +1690,7 @@ def _reload(source) -> None:
     # 磁盘满）。`!!lf reset` 早就兜了异常，命令面两种待遇说不过去：MCDR 只会记一条
     # traceback，管理员得不到任何回复（SLF-15）。
     try:
-        rules, pruned, carried = _apply_config(_server)
+        rules, pruned, carried, prune_error = _apply_config(_server)
         _log_summary(_server, rules)
         _announce_pruned(_server, pruned)
     except Exception as error:  # noqa: BLE001 - 命令面必须给出可读回复
@@ -1583,6 +1709,15 @@ def _reload(source) -> None:
         reply.append(RText(_t("reload.carried_session", count=carried), RColor.gray))
     if pruned:
         reply.append(RText(_t("reload.pruned", count=len(pruned)), RColor.gray))
+    if prune_error:
+        # 规则**已经生效**，只有统计清理失败——回复必须说清这个区别（SLF-A-08），
+        # 否则管理员会以为自己的修改没进去，然后去重复 reload / 重启。
+        reply.append(
+            RText(
+                _t("reload.prune_failed_reply", count=len(rules), error=prune_error),
+                RColor.red,
+            )
+        )
     source.reply(reply)
 
 
@@ -1602,8 +1737,15 @@ def _reset_streaks(source) -> None:
                     entry.zero_streak = 0
                     cleared += 1
             _save_state(_server, _state)
-    except Exception:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001
         _server.logger.exception(_t("state.reset_save_failed"))
+        # 不许谎报成功（SLF-A-05）：内存里的 zero_streak 确实清零了（本轮不再告警），
+        # 但没有落盘——重启或重载之后旧计数会原样回来，而管理员刚刚看到的是绿字
+        # 「已重置」，于是判断「reset 不起作用」。这里明确说清哪一半成功、哪一半失败，
+        # 并把异常原因一起给出来（控制台常常只看得到回复这一行）。
+        detail = "{}: {}".format(type(error).__name__, error)
+        source.reply(RText(_t("state.reset_save_failed_reply", error=detail), RColor.red))
+        return
     source.reply(
         RTextList(
             RText(_t("reset.done"), RColor.green),
@@ -1612,27 +1754,18 @@ def _reset_streaks(source) -> None:
     )
 
 
-# 控制台整行的前缀（``[12:00:00] [Server thread/INFO]: ``）。过滤器匹配的是 MCDR
-# **剥掉前缀之后**的正文，而管理员习惯整行复制，所以 !!logfilter test 也得先剥掉，
-# 否则 ``^`` 锚定的规则会被误报成「不命中」——人会去改本来写对的规则。
-_LOG_LINE_PREFIX = re.compile(r"^\[[^\]]*\]\s*\[[^\]]*\]\s*:\s?")
-
-
 def _test_line(source, context) -> None:
     if _log_filter is None:
         source.reply(RText(_t("cmd.not_initialised"), RColor.red))
         return
 
     text = context["text"]
-    # 显式判断，不用 ``_LOG_LINE_PREFIX.sub(...) or text``（SLF-15）：管理员若只粘贴了
-    # 前缀本身（``[12:00:00] [Server thread/INFO]: ``），剥完是**空串**——空串在布尔
-    # 上下文里是假值，``or`` 会退回带前缀的原文，于是 ``^`` 锚定的规则被报成「不命中」，
-    # 而真实过滤时该行确实会被剥掉前缀后匹配，结论正好相反。
-    # 所以：认得出前缀就一律用剥掉后的正文（哪怕它是空串），认不出才用原文。
-    if _LOG_LINE_PREFIX.match(text):
-        body = _LOG_LINE_PREFIX.sub("", text, count=1)
-    else:
-        body = text
+    # 正文与真实过滤**共用同一个取值函数**（SLF-A-02）：MCDR 剥两截（控制台前缀 +
+    # 玩家发言的 ``<玩家名> ``），这里也必须剥两截，否则 ``^hello`` 这类**正确**的
+    # 规则会被报成「不会被隐去」，管理员于是去改一条本来就对的规则。
+    # 只粘贴了前缀本身（``[12:00:00] [Server thread/INFO]: ``）时剥完是**空串**——
+    # 空串是合法正文（SLF-A-07），必须按空串测（SLF-15）。
+    body = _matching_body(text)
     matched = _log_filter.matching_rules(body)
 
     if not matched:

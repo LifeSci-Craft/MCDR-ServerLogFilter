@@ -23,10 +23,13 @@
   "reload.carried_session": "；本轮已命中的 {count} 次继续保留",
   "reload.failed": "[ServerLogFilter] !!logfilter reload 执行失败：{error}",
   "reload.failed_reply": "重载失败，规则保持原样，详见 MCDR 日志：{error}",
+  "reload.prune_failed": "[ServerLogFilter] 新规则已生效，但清理 state.json 里已删除规则的统计失败：{error}",
+  "reload.prune_failed_reply": "；当前 {count} 条规则已生效，但清理旧规则统计失败：{error}",
   "session.report": "本次运行共从 MCDR 控制台隐去 {total} 行服务端日志（服务端日志文件不受影响）",
   "help.logfilter": "服务端日志过滤器（!!lf）：查看状态 / 测试规则 / 重载规则",
   "state.save_failed": "写入日志过滤统计（state.json）失败",
   "state.reset_save_failed": "写入 state.json 失败",
+  "state.reset_save_failed_reply": "内存里的连续零命中计数已清零（本轮不再告警），但写入 state.json 失败（{error}）；重启或重载之后旧计数会回来",
   "state.broken_backup": "[ServerLogFilter] state.json 读不出来，已备份为 {backup} 并用空统计继续。命中历史与连续零命中计数会从零重新累计。",
   "state.pruned_header": "[ServerLogFilter] 已从 state.json 清除 {count} 条规则统计（它们已不在配置的 patterns 中）",
   "state.pruned_entry": "  · {pattern}",
@@ -92,5 +95,5 @@
   "test.hit_detail": "    命中规则: ",
   "test.miss": "不会被隐去",
   "test.miss_detail": "    该行不匹配任何规则",
-  "test.stripped_note": "（已剥掉 [时间] [线程/级别]: 前缀，按真正参与匹配的正文测试）"
+  "test.stripped_note": "（已剥掉 [时间] [线程/级别]: 与玩家发言的 <玩家名> 前缀，按真正参与匹配的正文测试）"
 }

@@ -88,8 +88,19 @@ write_server_output_to_log_file: false
 
 
 def write(path, text):
+    """Write ``text`` to ``path`` with LF newlines, on any Python this repo supports.
+
+    ``Path.write_text(..., newline="\\n")`` is a 3.10-only keyword, while the READMEs
+    (and ``ruff.toml``'s ``target-version``) put the floor at 3.9 -- and the docs tell the
+    maintainer to pass the 3.9 interpreter that ships with MCDR 2.15.0 to this script, so
+    the keyword would be a ``TypeError`` right there (SLF-A-11). Plain
+    ``write_text(text, encoding="utf-8")`` is not the answer either: with ``newline=None``
+    it translates ``\\n`` into ``os.linesep``, i.e. CRLF on Windows. Normalise and write
+    bytes instead, which also means the matrix never depends on the platform's newline.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    path.write_bytes(normalized.encode("utf-8"))
 
 
 def build_plugin() -> Path:
@@ -114,7 +125,7 @@ def _interpreter_has_own_mcdr(python: str) -> bool:
 def child_env(python: str) -> dict:
     """The environment to start MCDR (and, through it, the fake server) in.
 
-    Two things have to be right, and getting either wrong is silent:
+    Three things have to be right, and getting any of them wrong is silent:
 
     * ``.testlibs`` may be the only place MCDR exists — the CI layout, where the interpreter has
       nothing but pytest. Then it must be on ``PYTHONPATH``, and it must be an **absolute** path:
@@ -125,10 +136,17 @@ def child_env(python: str) -> dict:
       inherited ``PYTHONPATH`` must be **dropped**: it precedes site-packages, so a
       ``.testlibs/mcdreforged`` would shadow the version being tested and the matrix would
       report "several versions pass" while running one of them several times.
+    * The child's console output must be UTF-8. This parent decodes the pipe as UTF-8, while a
+      child on a non-UTF-8 locale (Chinese Windows, cp936) writes GBK: every Chinese sentence
+      turns into replacement characters, MCDR's own messages included. ``loaded``,
+      ``warning_shown`` and ``spoke_chinese`` then go false on **every** version even though the
+      plugin works — a false red on the release gate (SLF-A-06). ``tools/mutation_check.py`` and
+      ``conftest.py`` already pin this; the matrix was the one that forgot.
 
-    The probe decides, once per interpreter.
+    The probe decides PYTHONPATH, once per interpreter.
     """
     env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
     testlibs = REPO / ".testlibs"
 
     if not testlibs.is_dir() or _interpreter_has_own_mcdr(python):
@@ -234,7 +252,6 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
     out = "\n".join(lines)
     write(root / "console.txt", out + "\n")
 
-    loaded = "已启用 3 条日志过滤规则" in out
     dep_blocked = "不满足版本约束" in out
     done_at = out.find(STARTUP_LINE)
     # One stale rule, and the seeded config sets ``stale_rule_threshold`` to THRESHOLD, so the
@@ -251,15 +268,12 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
             state = {}
     rules = state.get("rules", {})
 
-    return {
+    result = {
         "mcdr": mcdr_version(python),
         "python": python,
-        "loaded": loaded,
+        "loaded": False,
         "refused_cleanly": dep_blocked,
-        # The config says ``language: auto`` and MCDR_CONFIG pins MCDR to zh_cn, so the
-        # plugin must speak Chinese here on every version. An MCDR without
-        # ``get_mcdr_language()`` would fall back to English and show up right here.
-        "spoke_chinese": loaded and "Enabled 3 log filter rule(s)" not in out,
+        "spoke_chinese": False,
         "target_lines_hidden": ("INFO]: Player Steve " + TARGET) not in out,
         "hitter_hidden": ("INFO]: " + HITTER) not in out,
         "unrelated_kept": UNRELATED in out,
@@ -279,6 +293,24 @@ def run_one(python: str, plugin: Path, workdir: Path) -> dict:
         "tracebacks": out.count("Traceback (most recent call last)"),
         "root": str(root),
     }
+    # 「插件加载了」不靠中文文案判定（SLF-A-06）：中文只在插件**真的**用中文说话时才出现，
+    # 把它当加载判据，会让「管道编码不对」与「插件没加载」得到同一个结论——三个版本一起红，
+    # 而真正的证据（目标行确实被隐去、一次开服周期确实被写进 state.json）就在同一个字典里。
+    # 这里改用**行为**判据：目标行与 hitter 行都消失、无关行保留、状态文件推进了一轮。
+    # 这几件事只有插件真的在跑才会发生，而且与语言 / 编码无关。
+    result["loaded"] = (
+        result["target_lines_hidden"]
+        and result["hitter_hidden"]
+        and result["unrelated_kept"]
+        and result["session_advanced"]
+    )
+    # The config says ``language: auto`` and MCDR_CONFIG pins MCDR to zh_cn, so the
+    # plugin must speak Chinese here on every version. An MCDR without
+    # ``get_mcdr_language()`` would fall back to English and show up right here.
+    result["spoke_chinese"] = (
+        result["loaded"] and "Enabled 3 log filter rule(s)" not in out
+    )
+    return result
 
 
 def verdict(r: dict) -> str:

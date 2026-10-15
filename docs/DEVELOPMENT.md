@@ -95,20 +95,28 @@ open(os.path.join(os.path.dirname(__file__), ...))   # 仅作为解包运行的�
 
 ## 持续集成
 
-`.github/workflows/ci.yml` 跑三个 job，对应上面三条命令：
+`.github/workflows/ci.yml` 跑 **6 个 job**：
 
 | job | 内容 | 为什么要分开 |
 |---|---|---|
-| `unit` | `MCDR_SKIP_E2E=1 pytest tests`，Python 3.10 / 3.13 | 快（约 40 s），两个 Python 版本都验一验语法与行为 |
+| `lint` | `ruff check .`（版本钉死在 workflow 里） | 几秒钟；风格问题不必等测试跑完 |
+| `unit` | `MCDR_SKIP_E2E=1 pytest tests`，Python **3.9 / 3.13** | 快（约 40 s），两个 Python 版本都验一验语法与行为；3.9 正是 README 声明的下限 |
 | `mutation` | `python tools/mutation_check.py` | 约 4 分钟，且**会改写源码再还原** —— 不能和别的 job 共用工作区 |
 | `e2e` | `pytest tests/test_e2e.py`（真实 MCDR） | 最慢、最依赖环境；失败时上传日志便于排查 |
+| `mcdr-matrix` | `tools/mcdr_matrix.py --current`，MCDR 2.15.0 / 2.15.7 / 2.16.0 各一个作业 | 每个作业用 `pip install --target` 装一个版本，所以三个版本、以及「MCDR 2.15.0 × Python 3.9」这个下限组合（`include`）都在 CI 里跑 |
+| `artifact` | `tools/check_artifact.py` | 产物可复现 + 可加载，与功能回归分开看 |
+
+三个 action 都按 **commit SHA** 固定（旁边注明版本号），升级由
+`.github/dependabot.yml` 开 PR；`setup-python` 打开了 pip 下载缓存
+（`cache-dependency-path: tests/requirements-test.txt`）。
 
 ⛔ **`mutation` job 不能设 `MCDR_SKIP_E2E`**：至少有一条变异（`arrives_after`）
 只有端到端测试能抓住，跳过 e2e 会让它被 pytest skip → 退出码 0 → 被误报成「测试没抓住」。
 `tools/mutation_check.py` 自己会拒绝在这种环境下运行，比指望 CI 配置写对可靠。
 
-> 跨版本矩阵（`tools/mcdr_matrix.py`）**不在 CI 里**：它需要三个各自装了不同 MCDR 的
-> Python 环境，在 runner 上重建不划算。发版前本地跑。
+> 跨版本矩阵**在 CI 里**（见上表）。本地跑它的理由不是补 CI 的缺口，而是**早发现**：
+> 不必等 CI 排队就知道这一改在最低支持版本上成不成立；`tools/mcdr_matrix.py` 也能接受
+> 「装了某个 MCDR 的解释器」当参数，用来复现某个特定环境。
 
 ## 包体积：打包时剥掉注释与 docstring
 
@@ -249,18 +257,18 @@ PYTHONPATH=.testlibs python -m pytest tests -v     # Windows: $env:PYTHONPATH=".
 > 出问题就在那一轮集中修，修完再提 PR。这样既避免反复烧时间，又保证合并前是完整的证据。
 > 汇报时说清「哪些跑过、哪些没跑」，不要用「全绿」掩盖没跑的部分。
 
-当前 **363 个用例**，分三层：
+当前 **414 个用例**，分三层：
 
 | 层 | 位置 | 说明 |
 |---|---|---|
-| 单元 | `tests/test_plugin.py` | 过滤逻辑、配置对象、命令面与权限、界面、打包、迁移、坏配置保全、语言、重载与计数（253 条） |
-| 端到端 | `tests/test_e2e.py` | 启动**真实 MCDR**，加载 `pack.py` 产出的 `.mcdr`，用假服务端跑完整生命周期（37 条） |
+| 单元 | `tests/test_plugin.py` | 过滤逻辑、配置对象、命令面与权限、界面、打包、迁移、坏配置保全、语言、重载与计数（379 条） |
+| 端到端 | `tests/test_e2e.py` | 启动**真实 MCDR**，加载 `pack.py` 产出的 `.mcdr`，用假服务端跑完整生命周期（35 条） |
 | 跨版本 | `tools/mcdr_matrix.py` | 同一个包在多个 MCDR 版本上逐项核对 |
 
 另有两个工具：
 
 ```bash
-python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（51 个变异，51/51 应被抓住）
+python tools/mutation_check.py    # 故意改坏实现，确认测试会变红（60 个变异，60/60 应被抓住）
 python benchmarks/bench_filter.py # 性能基准，README / CHANGELOG 里引用的数字都由它产出
 python benchmarks/bench_versions.py 旧.mcdr 新.mcdr   # 两个版本逐项对比，见「版本间性能对比」
 ```
@@ -690,9 +698,11 @@ bug 最好的藏身处**。
 **`!!logfilter test` 会把锚定规则误报成「不命中」。** 过滤器匹配的是 MCDR **剥掉
 `[时间] [线程/级别]:` 前缀之后**的正文（`info.content`），而命令拿用户粘贴的原文去匹配。
 管理员习惯整行复制，于是 `^Player \w+ joined` 这种写法会被告知「不命中」——
-而它其实工作得好好的，人反而会去改一条本来正确的规则。现在测试前先剥掉前缀
-（`_LOG_LINE_PREFIX`），并在回复里说明它这么做了。前缀正则只匹配最常见的
-`[..] [../LEVEL]:` 形态，认不出就不剥，行为与从前一致，不会有回归。
+而它其实工作得好好的，人反而会去改一条本来正确的规则。现在正文统一由
+`_matching_body()` 取出（过滤与 `test` 共用这一处），它剥两截：`[时间] [线程/级别]:`
+以及玩家发言的 `<玩家名> `，并在回复里说明它这么做了。前缀正则只匹配最常见的
+`[..] [../LEVEL]:` 形态，认不出就不剥（MCDR 自己也只有认得出这个前缀时才做玩家发言
+解析，认不出会退回 basic handler、正文就是整行），行为与从前一致，不会有回归。
 
 #### 「捕获的类型太窄」是一个反复出现的 bug 家族
 
