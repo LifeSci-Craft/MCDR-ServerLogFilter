@@ -32,8 +32,6 @@ PACK = "pack.py"
 WARN_BLOCK = """    if (
         _config is None
         or not _config.warn_about_stale_rules
-        or _state is None
-        or _log_filter is None
         or _config.stale_rule_threshold <= 0
     ):
         return
@@ -175,7 +173,7 @@ def silence_reset_announcement(src):
 PRUNE_ON_LOAD = (
     "    _announce_pruned(server, _prune_state(server, _state, _config.patterns))\n"
 )
-PRUNE_RELOAD_STEP = "            pruned = _prune_state(server, _state, configured)\n"
+PRUNE_RELOAD_STEP = "        pruned = _prune_state(server, _state, configured)\n"
 PRUNE_CALL = "    removed = _forget_orphans(state, patterns)\n"
 RESET_GUARD = "    if _config_was_reset:\n"
 
@@ -599,7 +597,7 @@ def count_console_input_too(src):
     管理员敲的那一行并没有被隐去。
     """
     return src.replace(
-        "        if not self.count_matches(content, count_line=not getattr(info, \"is_from_console\", False)):\n",
+        "        if not self.count_matches(content, count_line=not info.is_from_console):\n",
         "        if not self.count_matches(content):  # mutation: console input counted\n",
     )
 
