@@ -257,11 +257,7 @@ class ServerLogFilter(InfoFilter):
         # 函数调用。写成 ``default() ^ echo_to_console``（= 全部位去掉 echo 这一位）
         # 而不是 ``~InfoActionFlag.echo_to_console``：``enum.Flag.__invert__`` 在旧解释器
         # 上不保证存在，而本插件的底线是 Python 3.9。
-        self._hide_mask = (
-            InfoActionFlag.default() ^ InfoActionFlag.echo_to_console
-            if InfoActionFlag is not None
-            else None
-        )
+        self._hide_mask = InfoActionFlag.default() ^ InfoActionFlag.echo_to_console
 
     @property
     def rules(self) -> Tuple[Rule, ...]:
@@ -376,7 +372,7 @@ class ServerLogFilter(InfoFilter):
 
         # 控制台输入不算「已隐去的服务端日志行」（SLF-A-04）：echo_to_console 只对
         # 服务端输出生效。
-        if not self.count_matches(content, count_line=not getattr(info, "is_from_console", False)):
+        if not self.count_matches(content, count_line=not info.is_from_console):
             return
 
         # **只清 echo_to_console 这一位**，不整体赋值（SLF-A-03）：MCDR 会按注册顺序
@@ -1341,20 +1337,17 @@ def _apply_config(
         validate=_config.validate_patterns,
         probe_budget_ms=_config.pattern_probe_timeout_ms,
     )
-    carried = 0
-    if _log_filter is not None:
-        carried = _log_filter.reload_rules(rules, _config.log_matched_lines)
+    carried = _log_filter.reload_rules(rules, _config.log_matched_lines)
     # 拿一份 patterns 的局部副本再交给清理：`_config` 是模块级对象，命令线程下一次
     # 重载会整体替换它（SLF-12）。
     configured = list(_config.patterns)
     pruned: List[str] = []
     prune_error: Optional[str] = None
-    if _state is not None:
-        try:
-            pruned = _prune_state(server, _state, configured)
-        except Exception as error:  # noqa: BLE001 - 规则已生效，清理失败只降级为说明
-            prune_error = "{}: {}".format(type(error).__name__, error)
-            server.logger.exception(_t("reload.prune_failed", error=prune_error))
+    try:
+        pruned = _prune_state(server, _state, configured)
+    except Exception as error:  # noqa: BLE001 - 规则已生效，清理失败只降级为说明
+        prune_error = "{}: {}".format(type(error).__name__, error)
+        server.logger.exception(_t("reload.prune_failed", error=prune_error))
     return rules, pruned, carried, prune_error
 
 
@@ -1381,8 +1374,6 @@ def on_server_startup(server: PluginServerInterface) -> None:
     if (
         _config is None
         or not _config.warn_about_stale_rules
-        or _state is None
-        or _log_filter is None
         or _config.stale_rule_threshold <= 0
     ):
         return
@@ -1403,7 +1394,7 @@ def on_server_startup(server: PluginServerInterface) -> None:
 def on_server_stop(server: PluginServerInterface, server_return_code: int) -> None:
     global _session_reached_startup
 
-    if _log_filter is None or _config is None or _state is None:
+    if _config is None:
         return
 
     if _session_reached_startup:
@@ -1577,9 +1568,9 @@ def _show_status(source) -> None:
     with _state_mutex():
         streaks = {
             pattern: (entry.last_hit_session, entry.zero_streak)
-            for pattern, entry in (_state.rules.items() if _state is not None else ())
+            for pattern, entry in _state.rules.items()
         }
-        session_index = _state.session_index if _state is not None else 0
+        session_index = _state.session_index
 
     if i18n.normalize(_language_setting) in ("", i18n.AUTO):
         language_line = _t("status.language_auto", code=_language)
@@ -1598,7 +1589,7 @@ def _show_status(source) -> None:
         parts.append("\n")
         parts.append(RText(_t("status.no_rules"), RColor.yellow))
 
-    threshold = _config.stale_rule_threshold if _config is not None else 0
+    threshold = _config.stale_rule_threshold
     # 编号**只在真的需要时才补空格**：10 条以上补到两位，让 ``]`` 对齐；
     # 9 条以内直接印 ``[1]``，那个空格对用户只是噪音（曾被问过一次）。
     index_width = len(str(len(rules)))
