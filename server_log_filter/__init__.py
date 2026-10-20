@@ -600,12 +600,9 @@ def _announce_new_options(server: PluginServerInterface) -> None:
         _t("upgrade.title", count=len(_newly_added_options)),
     ]
     for name in _newly_added_options:
-        since, doc_key = CONFIG_DOC.get(name, ("?", None))
+        since, doc_key = CONFIG_DOC[name]
         lines.append(_t("upgrade.entry", name=name, since=since))
-        description = (
-            _t(doc_key) if doc_key is not None else _t("upgrade.no_description")
-        )
-        lines.append(_t("upgrade.entry_desc", desc=description))
+        lines.append(_t("upgrade.entry_desc", desc=_t(doc_key)))
     lines += [
         _t("upgrade.config_path", folder=_CONFIG_FOLDER_DISPLAY),
         _t("upgrade.readme_hint"),
@@ -945,9 +942,7 @@ def _apply_config(server: PluginServerInterface) -> Tuple[List[Rule], List[str],
         validate=_config.validate_patterns,
         probe_budget_ms=_config.pattern_probe_timeout_ms,
     )
-    carried = 0
-    if _log_filter is not None:
-        carried = _log_filter.reload_rules(rules, _config.log_matched_lines)
+    carried = _log_filter.reload_rules(rules, _config.log_matched_lines)
     pruned = [] if _state is None else _prune_state(server, _state, _config.patterns)
     return rules, pruned, carried
 
@@ -1138,10 +1133,6 @@ def _show_help(source) -> None:
 
 
 def _show_status(source) -> None:
-    if _log_filter is None:
-        source.reply(RText(_t("cmd.not_initialised"), RColor.red))
-        return
-
     rules = _log_filter.rules
     if i18n.normalize(_language_setting) in ("", i18n.AUTO):
         language_line = _t("status.language_auto", code=_language)
@@ -1160,7 +1151,7 @@ def _show_status(source) -> None:
         parts.append("\n")
         parts.append(RText(_t("status.no_rules"), RColor.yellow))
 
-    threshold = _config.stale_rule_threshold if _config is not None else 0
+    threshold = _config.stale_rule_threshold
     # 编号**只在真的需要时才补空格**：10 条以上补到两位，让 ``]`` 对齐；
     # 9 条以内直接印 ``[1]``，那个空格对用户只是噪音（曾被问过一次）。
     index_width = len(str(len(rules)))
@@ -1175,7 +1166,7 @@ def _show_status(source) -> None:
         parts.append(RText(_t("status.rule_hits", count=rule.count), RColor.green))
         parts.append(RText("-- ", RColor.gray))
         parts.append(RText(rule.pattern, RColor.white))
-        entry = _state.rules.get(rule.pattern) if _state is not None else None
+        entry = _state.rules.get(rule.pattern)
         if entry is not None and entry.last_hit_session:
             parts.append(
                 RText(
@@ -1223,7 +1214,7 @@ def _show_status(source) -> None:
             )
         )
 
-    if _state is not None and _state.session_index:
+    if _state.session_index:
         parts.append("\n")
         parts.append(
             _field(
@@ -1241,9 +1232,6 @@ def _show_status(source) -> None:
 
 def _reload(source) -> None:
     # 用插件自己的 _server，不能用 source.get_server()：后者没有 load_config_simple()
-    if _server is None:
-        source.reply(RText(_t("cmd.not_initialised_reload"), RColor.red))
-        return
     rules, pruned, carried = _apply_config(_server)
     _log_summary(_server, rules)
     _announce_pruned(_server, pruned)
@@ -1261,9 +1249,6 @@ def _reload(source) -> None:
 
 def _reset_streaks(source) -> None:
     """清空「连续零命中」计数，用于「确认这条规则本来就罕见，别再来烦我」。"""
-    if _server is None or _state is None or _log_filter is None:
-        source.reply(RText(_t("cmd.not_initialised_reset"), RColor.red))
-        return
     cleared = 0
     for rule in _log_filter.rules:
         entry = _state.rules.get(rule.pattern)
@@ -1289,10 +1274,6 @@ _LOG_LINE_PREFIX = re.compile(r"^\[[^\]]*\]\s*\[[^\]]*\]\s*:\s?")
 
 
 def _test_line(source, context) -> None:
-    if _log_filter is None:
-        source.reply(RText(_t("cmd.not_initialised"), RColor.red))
-        return
-
     text = context["text"]
     body = _LOG_LINE_PREFIX.sub("", text, count=1) or text
     matched = _log_filter.matching_rules(body)

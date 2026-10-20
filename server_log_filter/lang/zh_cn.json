@@ -32,7 +32,6 @@
   "upgrade.entry_desc": "      {desc}",
   "upgrade.config_path": "  配置文件：{folder}/config.json",
   "upgrade.readme_hint": "  各项含义见 README 的「配置」一节。",
-  "upgrade.no_description": "（未记录说明）",
 
   "broken.json_error": "JSON 语法错误：{error}",
   "broken.not_an_object": "顶层应为 JSON 对象，实际是 {kind}",
@@ -58,9 +57,6 @@
   "stale.advice_reset": "        或用 !!logfilter reset 清空计数重新观察。",
   "stale.note": "  （提醒本身不影响性能，只是为了保持配置干净。）",
 
-  "cmd.not_initialised": "日志过滤器尚未初始化",
-  "cmd.not_initialised_reload": "插件尚未初始化，无法重载",
-  "cmd.not_initialised_reset": "插件尚未初始化，无法重置",
   "status.rule_count": "规则数: ",
   "status.hidden_now": "    本次已隐去: ",
   "status.lines": " 行",

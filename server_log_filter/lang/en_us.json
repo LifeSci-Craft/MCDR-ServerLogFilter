@@ -32,7 +32,6 @@
   "upgrade.entry_desc": "      {desc}",
   "upgrade.config_path": "  Config file: {folder}/config.json",
   "upgrade.readme_hint": "  See the \"Configuration\" section of the README for what each one does.",
-  "upgrade.no_description": "(no description recorded)",
 
   "broken.json_error": "JSON syntax error: {error}",
   "broken.not_an_object": "the top level should be a JSON object, but it is {kind}",
@@ -58,9 +57,6 @@
   "stale.advice_reset": "          or use !!logfilter reset to clear the counters and start observing again.",
   "stale.note": "  (The reminder itself costs no performance -- it is only there to keep the config clean.)",
 
-  "cmd.not_initialised": "The log filter is not initialised yet",
-  "cmd.not_initialised_reload": "The plugin is not initialised yet, cannot reload",
-  "cmd.not_initialised_reset": "The plugin is not initialised yet, cannot reset",
   "status.rule_count": "Rules: ",
   "status.hidden_now": "    hidden this session: ",
   "status.lines": " line(s)",
